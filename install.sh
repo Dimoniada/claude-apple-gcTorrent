@@ -2,13 +2,13 @@
 # install.sh - one-time iSH setup for the rtorrent remote-control stack.
 #
 # Self-extracting: bridge.py and work.sh are bundled inside this file and
-# written to /root on run. Save just THIS file into iSH's /root (via the
-# Shortcut), then run it ONCE:  sh install.sh
+# written to /root on run. The Torrent Downloader shortcut fetches this file
+# via wget and runs it once:  sh install.sh && ./work.sh
 #
-# It does only the parts a file-copy can't: installs packages, writes
-# .rtorrent.rc, makes work.sh executable, and installs a .profile autostart
-# hook so future iSH launches auto-start rtorrent. It never runs work.sh
-# itself - the first launch stays manual (for the location permission popup).
+# It installs packages, writes .rtorrent.rc, makes work.sh executable, and
+# installs a .profile autostart hook so future iSH launches auto-start the
+# stack. work.sh is non-interactive (no "type yes"); it just needs the iOS
+# Location permission granted (Always) to keep running in the background.
 set -e
 
 echo "[0/4] extracting bundled bridge.py and work.sh..."
@@ -277,11 +277,16 @@ if __name__ == "__main__":
 __GCTORRENT_BRIDGE_PY__
 cat > /root/work.sh << '__GCTORRENT_WORK_SH__'
 #!/bin/sh
-# work.sh — boots the background keep-alive trick, sanity-checks it,
-# and only then launches rtorrent. Run this instead of `rtorrent` directly.
+# work.sh — boots the background location keep-alive, then launches
+# bridge.py + rtorrent. Run instead of `rtorrent` directly. Non-interactive.
 
 LOCATION_LOG="/root/.location_check"
 FLAG_FILE="/root/.location_always_confirmed"
+
+# Mark that setup has run, up front — so the .profile autostart hook will
+# retry on the next iSH open even if this run aborts before location is
+# granted. No manual re-run/typing needed.
+touch "$FLAG_FILE"
 
 rm -f "$LOCATION_LOG"
 
@@ -289,41 +294,24 @@ echo "Starting background keep-alive (location)..."
 cat /dev/location > "$LOCATION_LOG" 2>&1 &
 LOC_PID=$!
 
-sleep 3
+# Wait up to ~20s for the Location popup to be granted (data to start flowing),
+# instead of a hard 3s cutoff that loses the race with the permission dialog.
+i=0
+while [ ! -s "$LOCATION_LOG" ] && [ "$i" -lt 20 ]; do
+    sleep 1
+    i=$((i + 1))
+done
 
 if [ ! -s "$LOCATION_LOG" ]; then
     echo ""
-    echo "!!! Location permission is NOT working. !!!"
-    echo "rtorrent will be suspended as soon as you switch away from iSH."
-    echo ""
-    echo "Fix: Settings -> iSH -> Location -> Always"
-    echo "Then run this script again."
+    echo "!!! Location permission is NOT working yet. !!!"
+    echo "Set  Settings -> iSH -> Location -> Always, then just reopen iSH."
+    echo "It will start automatically - nothing to type."
     kill "$LOC_PID" 2>/dev/null
     exit 1
 fi
 
 echo "Location feed is active (PID $LOC_PID)."
-
-if [ ! -f "$FLAG_FILE" ]; then
-    echo ""
-    echo "=========================================================="
-    echo " FIRST-TIME CHECK (only needed once per iSH install)"
-    echo " Please confirm manually right now:"
-    echo "   Settings -> iSH -> Location -> should say 'Always'"
-    echo " (this script can only confirm location works in the"
-    echo "  foreground, not that it's specifically set to Always)"
-    echo "=========================================================="
-    echo ""
-    printf "Type 'yes' once you've confirmed it says Always: "
-    read answer
-    if [ "$answer" != "yes" ]; then
-        echo "Aborting — please confirm the setting, then rerun this script."
-        kill "$LOC_PID" 2>/dev/null
-        exit 1
-    fi
-    touch "$FLAG_FILE"
-fi
-
 echo "Starting rtorrent..."
 python3 /root/bridge.py > /root/.bridge.log 2>&1 &
 BRIDGE_PID=$!
@@ -369,6 +357,6 @@ PROFEOF
 fi
 
 echo ""
-echo "Setup done. Now run:  ./work.sh"
-echo "First run only: allow the location popup, set Settings > iSH > Location > Always, type yes."
-echo "After that, just opening iSH auto-starts rtorrent (via the .profile hook)."
+echo "Setup done - starting rtorrent now..."
+echo "Allow the Location popup, then set Settings > iSH > Location > Always."
+echo "After that, just opening iSH auto-starts everything (via the .profile hook)."
