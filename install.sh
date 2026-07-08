@@ -36,7 +36,7 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /pause   {"hash":...}                  -> {"ok": true}
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /prefs   {"lastPath":...}              -> {"ok": true}
-    POST /quit                                  -> {"ok": true}
+    POST /detach                                -> {"ok": true}
 
 Error codes: DAEMON_UNREACHABLE, INVALID_LINK, BAD_REQUEST, NOT_FOUND.
 
@@ -61,6 +61,11 @@ BRIDGE_PORT = 5001
 # home), which is also where rtorrent's download directories live — so paths
 # stored here are valid iSH paths, not iOS Files paths.
 PREFS_PATH = os.path.expanduser("~/.torrent_prefs.json")
+
+# Sentinel for "maintenance mode": while this file exists, the .profile autostart
+# hook skips launching the backend, so iSH opens to a shell prompt (even across
+# restarts). POST /detach creates it; install.sh removes it on (re)install.
+DETACH_FLAG = os.path.expanduser("~/.detached")
 
 
 def scgi_call(method, params=()):
@@ -164,15 +169,24 @@ def do_add(url, directory):
     )
 
 
-def do_quit():
-    """Best-effort: stop rtorrent so work.sh falls through to an interactive
-    shell prompt. This lets the Shortcut free the iSH terminal *before* opening
-    it for a reinstall, so the user pastes the reinstall command once, at a real
-    prompt, instead of first quitting rtorrent by hand (Ctrl-Q).
+def do_detach():
+    """Put the backend into 'maintenance mode' and stop rtorrent, so the Shortcut
+    can free the iSH terminal *before* opening it for a reinstall — the user
+    pastes the reinstall command once, at a real shell prompt, instead of
+    quitting rtorrent by hand (Ctrl-Q).
 
-    Always succeeds from the caller's side: if rtorrent isn't running there is
-    simply nothing to stop. SIGTERM lets rtorrent save its session and exit
-    cleanly; -x matches the exact process name, like the .profile guard does."""
+    Writes the ~/.detached sentinel that the .profile autostart hook checks, so
+    rtorrent stays stopped even if iSH is closed and reopened during the
+    reinstall; install.sh removes the sentinel, re-enabling autostart. Then
+    SIGTERM rtorrent (clean session save); -x matches the exact process name,
+    like the autostart guard does.
+
+    Always succeeds from the caller's side: a missing pkill or an already-stopped
+    rtorrent still leaves us detached."""
+    try:
+        open(DETACH_FLAG, "w").close()
+    except OSError:
+        pass
     try:
         subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
     except Exception:  # noqa: BLE001 - pkill missing/odd env: still report ok
@@ -289,8 +303,8 @@ class Handler(BaseHTTPRequestHandler):
                 prefs["lastPath"] = data.get("lastPath", "")
                 write_prefs(prefs)
                 self._send_json({"ok": True})
-            elif self.path == "/quit":
-                do_quit()
+            elif self.path == "/detach":
+                do_detach()
                 self._send_json({"ok": True})
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
@@ -342,11 +356,29 @@ if [ ! -s "$LOCATION_LOG" ]; then
 fi
 
 echo "Location feed is active (PID $LOC_PID)."
-echo "Starting rtorrent..."
 python3 /root/bridge.py > /root/.bridge.log 2>&1 &
 BRIDGE_PID=$!
 echo "Status bridge running (PID $BRIDGE_PID) on 127.0.0.1:5001"
 
+# Grace window: give a Ctrl-C escape to a shell before rtorrent grabs the
+# terminal, so a reinstall/repair can be pasted even when nothing is listening
+# to receive a bridge POST /detach (e.g. a cold iSH launch). Do nothing and
+# rtorrent starts as usual — zero typing for the normal path.
+DETACH_FLAG="/root/.detached"
+echo ""
+echo "Starting rtorrent in 3s — press Ctrl-C now for a maintenance shell."
+trap 'echo; echo "Maintenance shell. To reinstall the backend, run:"; echo "  cd /root && wget -qO install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh install.sh"; kill "$BRIDGE_PID" 2>/dev/null; exit 0' INT
+sleep 3
+trap - INT
+
+# A detach that landed during the countdown means stay in maintenance mode.
+if [ -f "$DETACH_FLAG" ]; then
+    echo "Detached (maintenance mode) — not starting rtorrent."
+    kill "$BRIDGE_PID" 2>/dev/null
+    exit 0
+fi
+
+echo "Starting rtorrent..."
 rtorrent
 
 # rtorrent only returns here when it exits (crash or manual quit) — clean up
@@ -377,14 +409,28 @@ echo "[3/4] making work.sh executable..."
 chmod +x /root/work.sh
 
 echo "[4/4] installing .profile autostart hook..."
-if ! grep -q 'torrent-autostart' /root/.profile 2>/dev/null; then
-    cat >> /root/.profile << 'PROFEOF'
-# torrent-autostart
-if [ -f "$HOME/.location_always_confirmed" ] && ! pgrep -x rtorrent >/dev/null 2>&1; then
+# The mutable hook logic lives in its own file so a reinstall always refreshes
+# it; .profile only ever gets one stable line that sources this file.
+cat > /root/.torrent_autostart.sh << 'AUTOEOF'
+# Sourced from .profile on every iSH launch. Starts the backend unless the user
+# detached it: the bridge's POST /detach writes ~/.detached for maintenance mode
+# (e.g. before a reinstall), so iSH opens straight to a shell prompt.
+if [ -f "$HOME/.location_always_confirmed" ] && [ ! -f "$HOME/.detached" ] && ! pgrep -x rtorrent >/dev/null 2>&1; then
     /root/work.sh
 fi
-PROFEOF
+AUTOEOF
+
+# Migrate away from the old inline autostart block (pre-sourcing installs).
+sed -i '/# torrent-autostart/,/^fi$/d' /root/.profile 2>/dev/null
+
+# Make .profile source the hook file (idempotent single line).
+if ! grep -q 'torrent_autostart.sh' /root/.profile 2>/dev/null; then
+    echo '[ -f /root/.torrent_autostart.sh ] && . /root/.torrent_autostart.sh' >> /root/.profile
 fi
+
+# A (re)install means "return to normal": clear any maintenance flag so the next
+# iSH launch autostarts the backend again.
+rm -f /root/.detached
 
 echo ""
 echo "Setup done - starting rtorrent now..."
