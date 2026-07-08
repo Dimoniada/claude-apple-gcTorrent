@@ -197,6 +197,16 @@ def do_pause(h):
     scgi_call("d.pause", (h,))
 
 
+def as_bool(v):
+    """Coerce a JSON value to bool, treating the *strings* "false"/"0"/"no"/""
+    as False. iOS Shortcuts sends JSON boolean fields as text ("true"/"false"),
+    and Python's bool("false") is True — so a naive bool() would delete data on
+    a "Keep data" request. This makes the flag correct for text or real bools."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def do_remove(h, delete_file):
     """Stop + erase a torrent, optionally deleting its data. Copied from
     rtorrent_rpc.py's cmd_remove."""
@@ -296,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not h:
                     self._send_json({"ok": False, "error": "BAD_REQUEST"}, status=400)
                     return
-                do_remove(h, bool(data.get("deleteFile", False)))
+                do_remove(h, as_bool(data.get("deleteFile", False)))
                 self._send_json({"ok": True})
             elif self.path == "/prefs":
                 prefs = read_prefs()
