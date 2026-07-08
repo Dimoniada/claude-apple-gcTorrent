@@ -28,7 +28,7 @@ plain-text pipeline has been retired — everything (ping, list, add, pause,
 remove, prefs) goes through the endpoints below and returns JSON.
 
 Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
-    GET  /ping                                  -> {"ok": true}
+    GET  /ping                                  -> {"ok": true, "detached": bool}
     GET  /status                                -> {"ok": true, "torrents": [...]}
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
     GET  /prefs                                 -> {"ok": true, "lastPath": "<str>"}
@@ -38,6 +38,7 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /prefs   {"lastPath":...}              -> {"ok": true}
     POST /detach                                -> {"ok": true}
+    POST /attach                                -> {"ok": true}
 
 Error codes: DAEMON_UNREACHABLE, INVALID_LINK, BAD_REQUEST, NOT_FOUND.
 
@@ -65,16 +66,17 @@ BRIDGE_PORT = 5001
 # stored here are valid iSH paths, not iOS Files paths.
 PREFS_PATH = os.path.expanduser("~/.torrent_prefs.json")
 
-# Sentinel for "maintenance mode": while this file exists, the .profile autostart
-# hook skips launching the backend, so iSH opens to a shell prompt (even across
-# restarts). POST /detach creates it; install.sh removes it on (re)install.
+# Sentinel for "maintenance mode": while this file exists, work.sh keeps the
+# bridge up but does NOT start rtorrent, so iSH opens to a shell prompt (even
+# across restarts) while /ping still answers. POST /detach creates it;
+# POST /attach and install.sh remove it.
 DETACH_FLAG = os.path.expanduser("~/.detached")
 
 
 def log(*args):
     """One timestamped line of bridge activity. work.sh redirects the bridge's
-    stdout+stderr to ~/.bridge.log, so these land there (read it in iSH with
-    `cat ~/.bridge.log` / `tail -f ~/.bridge.log`) to trace rtorrent calls and
+    stdout+stderr to ~/bridge.log, so these land there (read it in iSH with
+    `cat ~/bridge.log` / `tail -f ~/bridge.log`) to trace rtorrent calls and
     surface errors — e.g. "rtorrent isn't responding" or "added but nothing
     happened"."""
     print(time.strftime("%H:%M:%S"), *args, flush=True)
@@ -222,11 +224,11 @@ def do_detach():
     pastes the reinstall command once, at a real shell prompt, instead of
     quitting rtorrent by hand (Ctrl-Q).
 
-    Writes the ~/.detached sentinel that the .profile autostart hook checks, so
-    rtorrent stays stopped even if iSH is closed and reopened during the
-    reinstall; install.sh removes the sentinel, re-enabling autostart. Then
-    SIGTERM rtorrent (clean session save); -x matches the exact process name,
-    like the autostart guard does.
+    Writes the ~/.detached sentinel that work.sh checks, so rtorrent stays stopped
+    across iSH restarts (the bridge itself keeps running, so /ping still answers
+    and reports detached=true). do_attach / a reinstall removes the sentinel to
+    resume. Then SIGTERM rtorrent (clean session save); -x matches the exact
+    process name, like the autostart guard does.
 
     Always succeeds from the caller's side: a missing pkill or an already-stopped
     rtorrent still leaves us detached."""
@@ -237,6 +239,17 @@ def do_detach():
     try:
         subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
     except Exception:  # noqa: BLE001 - pkill missing/odd env: still report ok
+        pass
+
+
+def do_attach():
+    """Leave maintenance mode: remove the ~/.detached sentinel so the next iSH
+    launch (autostart) starts rtorrent again. The bridge can't spawn rtorrent
+    itself — rtorrent needs the foreground TTY — so it resumes on the next open,
+    not instantly."""
+    try:
+        os.remove(DETACH_FLAG)
+    except OSError:
         pass
 
 
@@ -313,8 +326,14 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path
             if path == "/ping":
-                scgi_call("system.pid")
-                self._send_json({"ok": True})
+                # Report maintenance mode regardless of rtorrent's state, so the
+                # Shortcut can tell "detached on purpose" from "rtorrent crashed".
+                detached = os.path.exists(DETACH_FLAG)
+                try:
+                    scgi_call("system.pid")
+                    self._send_json({"ok": True, "detached": detached})
+                except RuntimeError as e:
+                    self._send_json({"ok": False, "detached": detached, "error": str(e)})
             elif path == "/status":
                 short = parse_qs(parsed.query).get("short", [None])[0]
                 self._send_json({"ok": True, "torrents": get_status(short)})
@@ -371,6 +390,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/detach":
                 do_detach()
                 self._send_json({"ok": True})
+            elif self.path == "/attach":
+                do_attach()
+                self._send_json({"ok": True})
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
         except RuntimeError as e:
@@ -388,17 +410,37 @@ if __name__ == "__main__":
 __GCTORRENT_BRIDGE_PY__
 cat > /root/work.sh << '__GCTORRENT_WORK_SH__'
 #!/bin/sh
-# work.sh — boots the background location keep-alive, then launches
-# bridge.py + rtorrent. Run instead of `rtorrent` directly. Non-interactive.
+# work.sh — starts the status bridge (always), and unless detached, the location
+# keep-alive + rtorrent. Run instead of `rtorrent` directly. Non-interactive.
 
 LOCATION_LOG="/root/.location_check"
 FLAG_FILE="/root/.location_always_confirmed"
+DETACH_FLAG="/root/.detached"
 
-# Mark that setup has run, up front — so the .profile autostart hook will
-# retry on the next iSH open even if this run aborts before location is
-# granted. No manual re-run/typing needed.
+# Mark that setup has run, up front — so the autostart hook keeps launching us on
+# future iSH opens even if this run aborts before location is granted.
 touch "$FLAG_FILE"
 
+# Start the status bridge FIRST and unconditionally (guarded so we never run a
+# second copy). Keeping it up whenever iSH is open lets the Shortcut always reach
+# 127.0.0.1:5001 — even with rtorrent down or in maintenance mode — so /ping
+# answers (ok:false / detached) instead of refusing the connection and
+# hard-halting the Shortcut.
+if ! pgrep -f "python3 /root/bridge.py" >/dev/null 2>&1; then
+    python3 /root/bridge.py > /root/bridge.log 2>&1 &
+    echo "Status bridge started on 127.0.0.1:5001"
+else
+    echo "Status bridge already running on 127.0.0.1:5001"
+fi
+
+# Maintenance mode: bridge stays up (above), rtorrent stays down, shell is free.
+# POST /attach (or a reinstall) removes the sentinel to resume on the next open.
+if [ -f "$DETACH_FLAG" ]; then
+    echo "Detached (maintenance mode) — rtorrent not started."
+    exit 0
+fi
+
+# Location keep-alive (needed only for the live torrent session).
 rm -f "$LOCATION_LOG"
 
 echo "Starting background keep-alive (location)..."
@@ -423,26 +465,11 @@ if [ ! -s "$LOCATION_LOG" ]; then
 fi
 
 echo "Location feed is active (PID $LOC_PID)."
-python3 /root/bridge.py > /root/.bridge.log 2>&1 &
-BRIDGE_PID=$!
-echo "Status bridge running (PID $BRIDGE_PID) on 127.0.0.1:5001"
-
-# Skip rtorrent if a POST /detach put us into maintenance mode (e.g. before a
-# reinstall). No startup countdown here — rtorrent launches immediately; to get
-# a shell when iSH opens straight into rtorrent, press Ctrl-Q (quit rtorrent).
-DETACH_FLAG="/root/.detached"
-if [ -f "$DETACH_FLAG" ]; then
-    echo "Detached (maintenance mode) — not starting rtorrent."
-    kill "$BRIDGE_PID" 2>/dev/null
-    exit 0
-fi
-
 echo "Starting rtorrent..."
 rtorrent
 
-# rtorrent only returns here when it exits (crash or manual quit) — clean up
-# the bridge process too, so a stale one isn't left listening on the port.
-kill "$BRIDGE_PID" 2>/dev/null
+# rtorrent exited (crash or Ctrl-Q). Leave the bridge running so the Shortcut can
+# still reach it; work.sh reuses it (the pgrep guard above) on the next launch.
 __GCTORRENT_WORK_SH__
 
 for f in bridge.py work.sh; do
@@ -471,10 +498,10 @@ echo "[4/4] installing .profile autostart hook..."
 # The mutable hook logic lives in its own file so a reinstall always refreshes
 # it; .profile only ever gets one stable line that sources this file.
 cat > /root/.torrent_autostart.sh << 'AUTOEOF'
-# Sourced from .profile on every iSH launch. Starts the backend unless the user
-# detached it: the bridge's POST /detach writes ~/.detached for maintenance mode
-# (e.g. before a reinstall), so iSH opens straight to a shell prompt.
-if [ -f "$HOME/.location_always_confirmed" ] && [ ! -f "$HOME/.detached" ] && ! pgrep -x rtorrent >/dev/null 2>&1; then
+# Sourced from .profile on every iSH launch. Runs work.sh, which always brings
+# the status bridge up and — unless detached (~/.detached) — starts rtorrent too.
+# The detached case is handled inside work.sh so the bridge still answers /ping.
+if [ -f "$HOME/.location_always_confirmed" ] && ! pgrep -x rtorrent >/dev/null 2>&1; then
     /root/work.sh
 fi
 AUTOEOF
@@ -496,6 +523,10 @@ fi
 # A (re)install means "return to normal": clear any maintenance flag so the next
 # iSH launch autostarts the backend again.
 rm -f /root/.detached
+
+# Stop any bridge from a previous version so the freshly-written bridge.py is the
+# one that runs when work.sh (re)starts it.
+pkill -f "python3 /root/bridge.py" 2>/dev/null || true
 
 echo ""
 echo "Setup done - starting rtorrent now..."
