@@ -489,6 +489,12 @@ cat > /root/.rtorrent.rc << 'RCEOF'
 network.scgi.open_port = 127.0.0.1:5000
 directory.default.set = /root/downloads
 session.path.set = /root/.session
+# Raise the XML-RPC request cap from the 512 KiB default so larger .torrent
+# files fit. The bridge sends the file as base64 inside the XML-RPC body
+# (load.raw_start), which inflates ~500 KB to ~690 KB and hit "Fault -503:
+# XML-RPC request too large. Max allowed is 524288 bytes". 8 MiB leaves room
+# for even multi-MB .torrent files.
+network.xmlrpc.size_limit.set = 8388608
 RCEOF
 
 echo "[3/4] making work.sh executable..."
