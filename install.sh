@@ -30,6 +30,7 @@ remove, prefs) goes through the endpoints below and returns JSON.
 Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /ping                                  -> {"ok": true}
     GET  /status                                -> {"ok": true, "torrents": [...]}
+    GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
     GET  /prefs                                 -> {"ok": true, "lastPath": "<str>"}
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
     POST /pause   {"hash":...}                  -> {"ok": true}
@@ -47,6 +48,7 @@ import os
 import shutil
 import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 from xmlrpc.client import dumps, loads
 
 RTORRENT_HOST = "127.0.0.1"
@@ -97,7 +99,10 @@ def scgi_call(method, params=()):
 
 # --- command logic (copied verbatim from the retired rtorrent_rpc.py) --------
 
-def get_status():
+def get_status(short=None):
+    # `short`, if given, is a shortHash prefix (first 6 hex of the info-hash).
+    # rtorrent only knows the full 40-char hash, so we filter here in the bridge.
+    short = short.lower() if short else None
     fields = (
         "d.hash=", "d.name=", "d.is_open=", "d.is_active=",
         "d.complete=", "d.down.rate=", "d.up.rate=", "d.message=",
@@ -107,6 +112,8 @@ def get_status():
     torrents = []
     for row in rows or []:
         h, name, is_open, is_active, complete, down_rate, up_rate, message, done, size = row
+        if short and h[:6].lower() != short:
+            continue
         downloading = int(down_rate) > 0
         uploading = int(up_rate) > 0
 
@@ -213,12 +220,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path == "/ping":
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/ping":
                 scgi_call("system.pid")
                 self._send_json({"ok": True})
-            elif self.path == "/status":
-                self._send_json({"ok": True, "torrents": get_status()})
-            elif self.path == "/prefs":
+            elif path == "/status":
+                short = parse_qs(parsed.query).get("short", [None])[0]
+                self._send_json({"ok": True, "torrents": get_status(short)})
+            elif path == "/prefs":
                 self._send_json({"ok": True, "lastPath": read_prefs().get("lastPath", "")})
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
