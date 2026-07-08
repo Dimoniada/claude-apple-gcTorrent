@@ -427,18 +427,10 @@ python3 /root/bridge.py > /root/.bridge.log 2>&1 &
 BRIDGE_PID=$!
 echo "Status bridge running (PID $BRIDGE_PID) on 127.0.0.1:5001"
 
-# Grace window: give a Ctrl-C escape to a shell before rtorrent grabs the
-# terminal, so a reinstall/repair can be pasted even when nothing is listening
-# to receive a bridge POST /detach (e.g. a cold iSH launch). Do nothing and
-# rtorrent starts as usual — zero typing for the normal path.
+# Skip rtorrent if a POST /detach put us into maintenance mode (e.g. before a
+# reinstall). No startup countdown here — rtorrent launches immediately; to get
+# a shell when iSH opens straight into rtorrent, press Ctrl-Q (quit rtorrent).
 DETACH_FLAG="/root/.detached"
-echo ""
-echo "Starting rtorrent in 3s — press Ctrl-C now for a maintenance shell."
-trap 'echo; echo "Maintenance shell. To reinstall the backend, run:"; echo "  cd /root && wget -qO install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh install.sh"; kill "$BRIDGE_PID" 2>/dev/null; exit 0' INT
-sleep 3
-trap - INT
-
-# A detach that landed during the countdown means stay in maintenance mode.
 if [ -f "$DETACH_FLAG" ]; then
     echo "Detached (maintenance mode) — not starting rtorrent."
     kill "$BRIDGE_PID" 2>/dev/null
