@@ -49,6 +49,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from xmlrpc.client import dumps, loads
@@ -66,6 +67,15 @@ PREFS_PATH = os.path.expanduser("~/.torrent_prefs.json")
 # hook skips launching the backend, so iSH opens to a shell prompt (even across
 # restarts). POST /detach creates it; install.sh removes it on (re)install.
 DETACH_FLAG = os.path.expanduser("~/.detached")
+
+
+def log(*args):
+    """One timestamped line of bridge activity. work.sh redirects the bridge's
+    stdout+stderr to ~/.bridge.log, so these land there (read it in iSH with
+    `cat ~/.bridge.log` / `tail -f ~/.bridge.log`) to trace rtorrent calls and
+    surface errors — e.g. "rtorrent isn't responding" or "added but nothing
+    happened"."""
+    print(time.strftime("%H:%M:%S"), *args, flush=True)
 
 
 def scgi_call(method, params=()):
@@ -93,6 +103,11 @@ def scgi_call(method, params=()):
                 break
             chunks.append(chunk)
     except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        # Skip the high-frequency status poll (d.multicall2) so a down rtorrent
+        # being polled by the dashboard doesn't flood the log; still record the
+        # user-initiated calls (add/pause/remove/ping) that we want to trace.
+        if method != "d.multicall2":
+            log("rtorrent call %s failed: %s (is rtorrent running?)" % (method, e))
         raise RuntimeError("DAEMON_UNREACHABLE") from e
     finally:
         sock.close()
@@ -160,13 +175,19 @@ def do_add(url, directory):
     is_magnet = url.startswith("magnet:")
     is_torrent_url = url.startswith("http://") or url.startswith("https://")
     if not (is_magnet or is_torrent_url):
+        log("add rejected (not a magnet/http link): %r" % url[:100])
         raise RuntimeError("INVALID_LINK")
 
     os.makedirs(os.path.expanduser(directory), exist_ok=True)
-    scgi_call(
+    log("add: loading %r into %s" % (url[:100], directory))
+    result = scgi_call(
         "load.start",
         ("", url, f'd.directory.set="{directory}"'),
     )
+    # load.start returns 0 when rtorrent accepted the request. The torrent then
+    # has to fetch metadata (magnets) before it shows up in /status, so "added"
+    # is not the same as "downloading" — this line tells the two apart.
+    log("add: rtorrent load.start returned %r" % (result,))
 
 
 def do_detach():
@@ -194,6 +215,7 @@ def do_detach():
 
 
 def do_pause(h):
+    log("pause: %s" % h)
     scgi_call("d.pause", (h,))
 
 
@@ -210,6 +232,7 @@ def as_bool(v):
 def do_remove(h, delete_file):
     """Stop + erase a torrent, optionally deleting its data. Copied from
     rtorrent_rpc.py's cmd_remove."""
+    log("remove: %s (deleteFile=%s)" % (h, delete_file))
     directory = scgi_call("d.directory", (h,))
     scgi_call("d.stop", (h,))
     scgi_call("d.close", (h,))
@@ -276,9 +299,11 @@ class Handler(BaseHTTPRequestHandler):
         except RuntimeError as e:
             self._send_json({"ok": False, "error": str(e)})
         except Exception as e:  # noqa: BLE001 - surface anything else as JSON
+            log("GET %s crashed: %s" % (self.path, e))
             self._send_json({"ok": False, "error": str(e)})
 
     def do_POST(self):
+        log("POST", self.path)
         try:
             try:
                 data = self._read_body()
@@ -319,14 +344,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
         except RuntimeError as e:
+            log("POST %s -> %s" % (self.path, e))
             self._send_json({"ok": False, "error": str(e)})
         except Exception as e:  # noqa: BLE001 - surface anything else as JSON
+            log("POST %s crashed: %s" % (self.path, e))
             self._send_json({"ok": False, "error": str(e)})
 
 
 if __name__ == "__main__":
     server = HTTPServer((RTORRENT_HOST, BRIDGE_PORT), Handler)
-    print(f"bridge.py listening on {RTORRENT_HOST}:{BRIDGE_PORT}")
+    log(f"bridge.py listening on {RTORRENT_HOST}:{BRIDGE_PORT}")
     server.serve_forever()
 __GCTORRENT_BRIDGE_PY__
 cat > /root/work.sh << '__GCTORRENT_WORK_SH__'
