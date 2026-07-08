@@ -36,6 +36,7 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /pause   {"hash":...}                  -> {"ok": true}
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /prefs   {"lastPath":...}              -> {"ok": true}
+    POST /quit                                  -> {"ok": true}
 
 Error codes: DAEMON_UNREACHABLE, INVALID_LINK, BAD_REQUEST, NOT_FOUND.
 
@@ -47,6 +48,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from xmlrpc.client import dumps, loads
@@ -162,6 +164,21 @@ def do_add(url, directory):
     )
 
 
+def do_quit():
+    """Best-effort: stop rtorrent so work.sh falls through to an interactive
+    shell prompt. This lets the Shortcut free the iSH terminal *before* opening
+    it for a reinstall, so the user pastes the reinstall command once, at a real
+    prompt, instead of first quitting rtorrent by hand (Ctrl-Q).
+
+    Always succeeds from the caller's side: if rtorrent isn't running there is
+    simply nothing to stop. SIGTERM lets rtorrent save its session and exit
+    cleanly; -x matches the exact process name, like the .profile guard does."""
+    try:
+        subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
+    except Exception:  # noqa: BLE001 - pkill missing/odd env: still report ok
+        pass
+
+
 def do_pause(h):
     scgi_call("d.pause", (h,))
 
@@ -271,6 +288,9 @@ class Handler(BaseHTTPRequestHandler):
                 prefs = read_prefs()
                 prefs["lastPath"] = data.get("lastPath", "")
                 write_prefs(prefs)
+                self._send_json({"ok": True})
+            elif self.path == "/quit":
+                do_quit()
                 self._send_json({"ok": True})
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
