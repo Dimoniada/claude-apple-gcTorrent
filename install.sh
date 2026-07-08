@@ -431,7 +431,13 @@ fi
 AUTOEOF
 
 # Migrate away from the old inline autostart block (pre-sourcing installs).
-sed -i '/# torrent-autostart/,/^fi$/d' /root/.profile 2>/dev/null
+# Guard on existence: on a clean install .profile doesn't exist yet, and a bare
+# `sed -i` on a missing file returns non-zero, which under `set -e` would abort
+# the script here — before the autostart hook below is written (leaving .profile
+# empty and rtorrent never auto-starting).
+if [ -f /root/.profile ]; then
+    sed -i '/# torrent-autostart/,/^fi$/d' /root/.profile
+fi
 
 # Make .profile source the hook file (idempotent single line).
 if ! grep -q 'torrent_autostart.sh' /root/.profile 2>/dev/null; then
