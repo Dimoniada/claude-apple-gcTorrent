@@ -33,6 +33,7 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
     GET  /prefs                                 -> {"ok": true, "lastPath": "<str>"}
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
+    POST /add     {"data":<base64 .torrent>, "directory":...} -> {"ok": true}
     POST /pause   {"hash":...}                  -> {"ok": true}
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /prefs   {"lastPath":...}              -> {"ok": true}
@@ -44,6 +45,7 @@ No third-party packages are used — only the Python standard library — so
 `apk add python3` is the only iSH-side dependency.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -52,7 +54,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
-from xmlrpc.client import dumps, loads
+from xmlrpc.client import Binary, dumps, loads
 
 RTORRENT_HOST = "127.0.0.1"
 RTORRENT_PORT = 5000
@@ -190,6 +192,30 @@ def do_add(url, directory):
     log("add: rtorrent load.start returned %r" % (result,))
 
 
+def do_add_raw(data_b64, directory):
+    """Load a .torrent from its raw bytes (base64) rather than a link — used when
+    the Shortcut passes the file itself (clipboard file / Share Sheet). rtorrent's
+    load.raw_start takes the bencoded content directly. Non-base64 chars (e.g. the
+    line breaks Shortcuts may add) are discarded by b64decode's default mode."""
+    try:
+        raw = base64.b64decode(data_b64 or "")
+    except (ValueError, TypeError):
+        log("add rejected (undecodable base64 .torrent data)")
+        raise RuntimeError("INVALID_LINK")
+    # A bencoded .torrent is a dict, so it starts with 'd' and ends with 'e'.
+    if not (raw[:1] == b"d" and raw[-1:] == b"e"):
+        log("add rejected (not a valid .torrent: %d bytes)" % len(raw))
+        raise RuntimeError("INVALID_LINK")
+
+    os.makedirs(os.path.expanduser(directory), exist_ok=True)
+    log("add: loading %d-byte .torrent file into %s" % (len(raw), directory))
+    result = scgi_call(
+        "load.raw_start",
+        ("", Binary(raw), f'd.directory.set="{directory}"'),
+    )
+    log("add: rtorrent load.raw_start returned %r" % (result,))
+
+
 def do_detach():
     """Put the backend into 'maintenance mode' and stop rtorrent, so the Shortcut
     can free the iSH terminal *before* opening it for a reinstall — the user
@@ -313,11 +339,15 @@ class Handler(BaseHTTPRequestHandler):
 
             if self.path == "/add":
                 url = data.get("url")
+                raw_data = data.get("data")
                 directory = data.get("directory")
-                if not url or not directory:
+                if not directory or not (url or raw_data):
                     self._send_json({"ok": False, "error": "BAD_REQUEST"}, status=400)
                     return
-                do_add(url, directory)
+                if raw_data:
+                    do_add_raw(raw_data, directory)
+                else:
+                    do_add(url, directory)
                 self._send_json({"ok": True})
             elif self.path == "/pause":
                 h = data.get("hash")
@@ -397,18 +427,10 @@ python3 /root/bridge.py > /root/.bridge.log 2>&1 &
 BRIDGE_PID=$!
 echo "Status bridge running (PID $BRIDGE_PID) on 127.0.0.1:5001"
 
-# Grace window: give a Ctrl-C escape to a shell before rtorrent grabs the
-# terminal, so a reinstall/repair can be pasted even when nothing is listening
-# to receive a bridge POST /detach (e.g. a cold iSH launch). Do nothing and
-# rtorrent starts as usual — zero typing for the normal path.
+# Skip rtorrent if a POST /detach put us into maintenance mode (e.g. before a
+# reinstall). No startup countdown here — rtorrent launches immediately; to get
+# a shell when iSH opens straight into rtorrent, press Ctrl-Q (quit rtorrent).
 DETACH_FLAG="/root/.detached"
-echo ""
-echo "Starting rtorrent in 3s — press Ctrl-C now for a maintenance shell."
-trap 'echo; echo "Maintenance shell. To reinstall the backend, run:"; echo "  cd /root && wget -qO install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh install.sh"; kill "$BRIDGE_PID" 2>/dev/null; exit 0' INT
-sleep 3
-trap - INT
-
-# A detach that landed during the countdown means stay in maintenance mode.
 if [ -f "$DETACH_FLAG" ]; then
     echo "Detached (maintenance mode) — not starting rtorrent."
     kill "$BRIDGE_PID" 2>/dev/null
