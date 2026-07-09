@@ -2,8 +2,9 @@
 # install.sh - one-time iSH setup for the rtorrent remote-control stack.
 #
 # Self-extracting: bridge.py and work.sh are bundled inside this file and
-# written to /root on run. The Torrent Downloader shortcut fetches this file
-# via wget and runs it once:  sh install.sh && ./work.sh
+# written to /root/gctorrent on run (alongside the log, prefs, and state flags).
+# The Torrent Downloader shortcut fetches this file via wget and runs it once:
+#   sh install.sh && /root/gctorrent/work.sh
 #
 # It installs packages, writes .rtorrent.rc, makes work.sh executable, and
 # installs a .profile autostart hook so future iSH launches auto-start the
@@ -12,7 +13,11 @@
 set -e
 
 echo "[0/4] extracting bundled bridge.py and work.sh..."
-cat > /root/bridge.py << '__GCTORRENT_BRIDGE_PY__'
+# All app files (source, log, prefs, state flags) live under /root/gctorrent/.
+# .rtorrent.rc and .profile stay pinned in $HOME (rtorrent and the shell read
+# them from there); downloads/ and .session/ stay in /root as they are data.
+mkdir -p /root/gctorrent/state
+cat > /root/gctorrent/bridge.py << '__GCTORRENT_BRIDGE_PY__'
 #!/usr/bin/env python3
 """
 bridge.py — runs INSIDE iSH, alongside rtorrent itself.
@@ -46,6 +51,7 @@ No third-party packages are used — only the Python standard library — so
 `apk add python3` is the only iSH-side dependency.
 """
 
+import atexit
 import base64
 import json
 import os
@@ -61,22 +67,30 @@ RTORRENT_HOST = "127.0.0.1"
 RTORRENT_PORT = 5000
 BRIDGE_PORT = 5001
 
-# Replaces the a-Shell torrent_prefs.json. Lives in iSH's filesystem (root's
-# home), which is also where rtorrent's download directories live — so paths
-# stored here are valid iSH paths, not iOS Files paths.
-PREFS_PATH = os.path.expanduser("~/.torrent_prefs.json")
+# All app files live under ~/gctorrent/. Prefs replace the a-Shell
+# torrent_prefs.json; paths stored here are valid iSH paths (root's home, where
+# rtorrent's download directories also live), not iOS Files paths.
+APP_DIR = os.path.expanduser("~/gctorrent")
+STATE_DIR = os.path.join(APP_DIR, "state")
+PREFS_PATH = os.path.join(APP_DIR, "prefs.json")
 
 # Sentinel for "maintenance mode": while this file exists, work.sh keeps the
 # bridge up but does NOT start rtorrent, so iSH opens to a shell prompt (even
 # across restarts) while /ping still answers. POST /detach creates it;
 # POST /attach and install.sh remove it.
-DETACH_FLAG = os.path.expanduser("~/.detached")
+DETACH_FLAG = os.path.join(STATE_DIR, "detached")
+
+# Readiness marker: written once the HTTP server has bound :5001, so work.sh can
+# wait for it before launching rtorrent — which otherwise starves the bridge's
+# bind for CPU in the slow iSH emulator and makes an early /ping refuse. work.sh
+# clears it before spawning a fresh bridge; the bridge removes it on exit.
+READY_FLAG = os.path.join(STATE_DIR, "bridge_ready")
 
 
 def log(*args):
     """One timestamped line of bridge activity. work.sh redirects the bridge's
-    stdout+stderr to ~/bridge.log, so these land there (read it in iSH with
-    `cat ~/bridge.log` / `tail -f ~/bridge.log`) to trace rtorrent calls and
+    stdout+stderr to ~/gctorrent/bridge.log, so these land there (read it in iSH
+    with `cat ~/gctorrent/bridge.log` / `tail -f ~/gctorrent/bridge.log`) to trace rtorrent calls and
     surface errors — e.g. "rtorrent isn't responding" or "added but nothing
     happened"."""
     print(time.strftime("%H:%M:%S"), *args, flush=True)
@@ -292,6 +306,7 @@ def read_prefs():
 
 
 def write_prefs(prefs):
+    os.makedirs(APP_DIR, exist_ok=True)
     with open(PREFS_PATH, "w") as f:
         json.dump(prefs, f)
 
@@ -405,17 +420,30 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = HTTPServer((RTORRENT_HOST, BRIDGE_PORT), Handler)
+    # The bind above succeeded — announce readiness so work.sh stops waiting and
+    # launches rtorrent. Remove it on exit so a stale marker never outlives us.
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(READY_FLAG, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(
+        lambda: os.path.exists(READY_FLAG) and os.remove(READY_FLAG)
+    )
     log(f"bridge.py listening on {RTORRENT_HOST}:{BRIDGE_PORT}")
     server.serve_forever()
 __GCTORRENT_BRIDGE_PY__
-cat > /root/work.sh << '__GCTORRENT_WORK_SH__'
+cat > /root/gctorrent/work.sh << '__GCTORRENT_WORK_SH__'
 #!/bin/sh
 # work.sh — starts the status bridge (always), and unless detached, the location
 # keep-alive + rtorrent. Run instead of `rtorrent` directly. Non-interactive.
 
-LOCATION_LOG="/root/.location_check"
-FLAG_FILE="/root/.location_always_confirmed"
-DETACH_FLAG="/root/.detached"
+APP_DIR="/root/gctorrent"
+STATE_DIR="$APP_DIR/state"
+LOCATION_LOG="$STATE_DIR/location_check"
+FLAG_FILE="$STATE_DIR/location_confirmed"
+DETACH_FLAG="$STATE_DIR/detached"
+READY_FLAG="$STATE_DIR/bridge_ready"
+
+mkdir -p "$STATE_DIR"
 
 # Mark that setup has run, up front — so the autostart hook keeps launching us on
 # future iSH opens even if this run aborts before location is granted.
@@ -426,8 +454,13 @@ touch "$FLAG_FILE"
 # 127.0.0.1:5001 — even with rtorrent down or in maintenance mode — so /ping
 # answers (ok:false / detached) instead of refusing the connection and
 # hard-halting the Shortcut.
-if ! pgrep -f "python3 /root/bridge.py" >/dev/null 2>&1; then
-    python3 /root/bridge.py > /root/bridge.log 2>&1 &
+if ! pgrep -f "python3 $APP_DIR/bridge.py" >/dev/null 2>&1; then
+    # Clear any stale readiness marker so the wait before rtorrent tracks THIS
+    # bridge's bind, not a dead one's. Only the spawn path clears it — when the
+    # bridge is already running (else branch), its marker persists so the wait
+    # passes at once.
+    rm -f "$READY_FLAG"
+    python3 "$APP_DIR/bridge.py" > "$APP_DIR/bridge.log" 2>&1 &
     echo "Status bridge started on 127.0.0.1:5001"
 else
     echo "Status bridge already running on 127.0.0.1:5001"
@@ -465,6 +498,18 @@ if [ ! -s "$LOCATION_LOG" ]; then
 fi
 
 echo "Location feed is active (PID $LOC_PID)."
+
+# Wait for the bridge to finish binding :5001 before rtorrent grabs the CPU. In
+# the slow iSH emulator an immediate rtorrent launch starves the bridge's bind,
+# so a Shortcut /ping in that window gets refused (a hard halt). bridge.py writes
+# the marker the moment it's listening, so this usually passes at once — the
+# location wait above already gave it a head start.
+i=0
+while [ ! -f "$READY_FLAG" ] && [ "$i" -lt 15 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+
 echo "Starting rtorrent..."
 rtorrent
 
@@ -473,8 +518,8 @@ rtorrent
 __GCTORRENT_WORK_SH__
 
 for f in bridge.py work.sh; do
-    if [ ! -f "/root/$f" ]; then
-        echo "Missing /root/$f after extraction - aborting."
+    if [ ! -f "/root/gctorrent/$f" ]; then
+        echo "Missing /root/gctorrent/$f after extraction - aborting."
         exit 1
     fi
 done
@@ -498,41 +543,57 @@ network.xmlrpc.size_limit.set = 8388608
 RCEOF
 
 echo "[3/4] making work.sh executable..."
-chmod +x /root/work.sh
+chmod +x /root/gctorrent/work.sh
 
 echo "[4/4] installing .profile autostart hook..."
 # The mutable hook logic lives in its own file so a reinstall always refreshes
 # it; .profile only ever gets one stable line that sources this file.
-cat > /root/.torrent_autostart.sh << 'AUTOEOF'
+cat > /root/gctorrent/autostart.sh << 'AUTOEOF'
 # Sourced from .profile on every iSH launch. Runs work.sh, which always brings
-# the status bridge up and — unless detached (~/.detached) — starts rtorrent too.
-# The detached case is handled inside work.sh so the bridge still answers /ping.
-if [ -f "$HOME/.location_always_confirmed" ] && ! pgrep -x rtorrent >/dev/null 2>&1; then
-    /root/work.sh
+# the status bridge up and — unless detached — starts rtorrent too. The detached
+# case is handled inside work.sh so the bridge still answers /ping.
+if [ -f "/root/gctorrent/state/location_confirmed" ] && ! pgrep -x rtorrent >/dev/null 2>&1; then
+    /root/gctorrent/work.sh
 fi
 AUTOEOF
 
-# Migrate away from the old inline autostart block (pre-sourcing installs).
-# Guard on existence: on a clean install .profile doesn't exist yet, and a bare
-# `sed -i` on a missing file returns non-zero, which under `set -e` would abort
-# the script here — before the autostart hook below is written (leaving .profile
+# Migrate .profile: drop the old inline autostart block (pre-sourcing installs)
+# AND the old hook-sourcing line (pre-reorg /root/.torrent_autostart.sh), then
+# add the new one below. Guard on existence: on a clean install .profile doesn't
+# exist yet, and a bare `sed -i` on a missing file returns non-zero, which under
+# `set -e` would abort here — before the hook line is added (leaving .profile
 # empty and rtorrent never auto-starting).
 if [ -f /root/.profile ]; then
-    sed -i '/# torrent-autostart/,/^fi$/d' /root/.profile
+    sed -i -e '/# torrent-autostart/,/^fi$/d' -e '/\.torrent_autostart\.sh/d' /root/.profile
 fi
 
 # Make .profile source the hook file (idempotent single line).
-if ! grep -q 'torrent_autostart.sh' /root/.profile 2>/dev/null; then
-    echo '[ -f /root/.torrent_autostart.sh ] && . /root/.torrent_autostart.sh' >> /root/.profile
+if ! grep -q 'gctorrent/autostart.sh' /root/.profile 2>/dev/null; then
+    echo '[ -f /root/gctorrent/autostart.sh ] && . /root/gctorrent/autostart.sh' >> /root/.profile
 fi
 
-# A (re)install means "return to normal": clear any maintenance flag so the next
-# iSH launch autostarts the backend again.
-rm -f /root/.detached
+# Migrate prefs from the pre-reorg location so a saved save-path survives.
+if [ -f /root/.torrent_prefs.json ] && [ ! -f /root/gctorrent/prefs.json ]; then
+    mv /root/.torrent_prefs.json /root/gctorrent/prefs.json
+fi
 
-# Stop any bridge from a previous version so the freshly-written bridge.py is the
-# one that runs when work.sh (re)starts it.
-pkill -f "python3 /root/bridge.py" 2>/dev/null || true
+# Carry the location grant forward so autostart keeps working without re-granting.
+if [ -f /root/.location_always_confirmed ]; then
+    touch /root/gctorrent/state/location_confirmed
+fi
+
+# Remove pre-reorg orphans now that everything lives under /root/gctorrent/.
+rm -f /root/bridge.py /root/work.sh /root/.torrent_autostart.sh \
+      /root/.location_check /root/.location_always_confirmed /root/.torrent_prefs.json
+
+# A (re)install means "return to normal": clear any maintenance flag so the next
+# iSH launch autostarts the backend again, and drop the readiness marker so the
+# freshly-spawned bridge is the one that recreates it.
+rm -f /root/gctorrent/state/detached /root/gctorrent/state/bridge_ready
+
+# Stop any bridge from a previous version (old /root or new /root/gctorrent path)
+# so the freshly-written bridge.py is the one that runs when work.sh (re)starts it.
+pkill -f "python3 /root/.*bridge.py" 2>/dev/null || true
 
 echo ""
 echo "Setup done - starting rtorrent now..."
