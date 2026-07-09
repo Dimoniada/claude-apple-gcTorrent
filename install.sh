@@ -2,9 +2,10 @@
 # install.sh - one-time iSH setup for the rtorrent remote-control stack.
 #
 # Self-extracting: bridge.py and work.sh are bundled inside this file and
-# written to /root/gctorrent on run (alongside the log, prefs, and state flags).
-# The Torrent Downloader shortcut fetches this file via wget and runs it once:
-#   sh install.sh && /root/gctorrent/work.sh
+# written to /root/gctorrent on run (alongside the log, settings, and state
+# flags). It finishes by removing itself and exec'ing work.sh, so the Torrent
+# Downloader shortcut fetches and runs it in a single step:
+#   … && sh install.sh
 #
 # It installs packages, writes .rtorrent.rc, makes work.sh executable, and
 # installs a .profile autostart hook so future iSH launches auto-start the
@@ -478,6 +479,11 @@ READY_FLAG="$STATE_DIR/bridge_ready"
 
 mkdir -p "$STATE_DIR"
 
+# Remove the one-shot installer bootstrap if it's still around (install.sh execs
+# us at the end of a fresh install/update). By now install.sh is a closed file,
+# so this is an ordinary unlink; harmless -f no-op on normal autostart launches.
+rm -f /root/install.sh
+
 # Mark that setup has run, up front — so the autostart hook keeps launching us on
 # future iSH opens even if this run aborts before location is granted.
 touch "$FLAG_FILE"
@@ -639,3 +645,11 @@ echo ""
 echo "Setup done - starting rtorrent now..."
 echo "Allow the Location popup, then set Settings > iSH > Location > Always."
 echo "After that, just opening iSH auto-starts everything (via the .profile hook)."
+
+# Hand off to the backend: exec replaces this shell with work.sh, which brings up
+# the bridge and rtorrent — so `sh install.sh` alone finishes the whole first run
+# and the caller needs no trailing work.sh step. work.sh deletes the one-shot
+# /root/install.sh bootstrap on startup, so /root stays clean WITHOUT this script
+# unlinking itself mid-run: after exec, install.sh is a closed file the next
+# process removes normally (no reliance on unlink-while-open).
+exec sh /root/gctorrent/work.sh
