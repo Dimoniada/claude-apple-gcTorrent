@@ -336,7 +336,10 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep iSH's console quiet
 
     def _send_json(self, obj, status=200):
-        body = json.dumps(obj).encode("utf-8")
+        # Compact separators (no space after ':' or ',') so the iOS Shortcut's
+        # locale-proof `Contains "key":value` text checks match the raw body.
+        # Every endpoint replies through here, so this covers all APIs/fields.
+        body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         # CORS header so the Scriptable WebView (loaded via loadHTML, treated
