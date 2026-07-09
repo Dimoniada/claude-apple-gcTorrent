@@ -40,7 +40,8 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /settings                              -> {"ok": true, "lastPath": "<str>", "pollMs": <int>}
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
     POST /add     {"data":<base64 .torrent>, "directory":...} -> {"ok": true}
-    POST /pause   {"hash":...}                  -> {"ok": true}
+    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.stop)
+    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.start)
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /settings {"lastPath":...} and/or {"pollMs":...} -> {"ok": true}
     POST /detach                                -> {"ok": true}
@@ -152,14 +153,14 @@ def get_status(short=None):
     # rtorrent only knows the full 40-char hash, so we filter here in the bridge.
     short = short.lower() if short else None
     fields = (
-        "d.hash=", "d.name=", "d.is_open=", "d.is_active=",
+        "d.hash=", "d.name=", "d.is_open=", "d.is_active=", "d.state=",
         "d.complete=", "d.down.rate=", "d.up.rate=", "d.message=",
         "d.bytes_done=", "d.size_bytes=",
     )
     rows = scgi_call("d.multicall2", ("", "main") + fields)
     torrents = []
     for row in rows or []:
-        h, name, is_open, is_active, complete, down_rate, up_rate, message, done, size = row
+        h, name, is_open, is_active, state, complete, down_rate, up_rate, message, done, size = row
         if short and h[:6].lower() != short:
             continue
         downloading = int(down_rate) > 0
@@ -167,6 +168,12 @@ def get_status(short=None):
 
         if message:
             status = "ERROR"
+        elif not int(state) or not int(is_active):
+            # Stopped (d.stop -> state 0) or paused (is_active 0). Checked before
+            # the rate branches so a just-paused torrent reports PAUSED at once,
+            # instead of lingering as DOWNLOADING while rtorrent's rolling rate
+            # decays to 0.
+            status = "PAUSED"
         elif downloading and uploading:
             status = "DOWNLOADING&UPLOADING"
         elif downloading:
@@ -276,8 +283,17 @@ def do_attach():
 
 
 def do_pause(h):
-    log("pause: %s" % h)
-    scgi_call("d.pause", (h,))
+    # d.stop, not d.pause: a hard stop persists across rtorrent restarts and sets
+    # d.state=0 immediately, so get_status reports PAUSED reliably and at once.
+    # d.pause is a soft, non-persistent throttle that get_status couldn't detect.
+    log("pause (stop): %s" % h)
+    scgi_call("d.stop", (h,))
+
+
+def do_resume(h):
+    # Mirror of do_pause: restart the stopped torrent from where it left off.
+    log("resume (start): %s" % h)
+    scgi_call("d.start", (h,))
 
 
 def as_bool(v):
@@ -416,6 +432,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "BAD_REQUEST"}, status=400)
                     return
                 do_pause(h)
+                self._send_json({"ok": True})
+            elif self.path == "/resume":
+                h = data.get("hash")
+                if not h:
+                    self._send_json({"ok": False, "error": "BAD_REQUEST"}, status=400)
+                    return
+                do_resume(h)
                 self._send_json({"ok": True})
             elif self.path == "/remove":
                 h = data.get("hash")
