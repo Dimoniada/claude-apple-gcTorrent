@@ -36,12 +36,12 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /ping                                  -> {"ok": true, "detached": bool}
     GET  /status                                -> {"ok": true, "torrents": [...]}
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
-    GET  /prefs                                 -> {"ok": true, "lastPath": "<str>"}
+    GET  /settings                              -> {"ok": true, "lastPath": "<str>", "pollMs": <int>}
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
     POST /add     {"data":<base64 .torrent>, "directory":...} -> {"ok": true}
     POST /pause   {"hash":...}                  -> {"ok": true}
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
-    POST /prefs   {"lastPath":...}              -> {"ok": true}
+    POST /settings {"lastPath":...} and/or {"pollMs":...} -> {"ok": true}
     POST /detach                                -> {"ok": true}
     POST /attach                                -> {"ok": true}
 
@@ -67,12 +67,19 @@ RTORRENT_HOST = "127.0.0.1"
 RTORRENT_PORT = 5000
 BRIDGE_PORT = 5001
 
-# All app files live under ~/gctorrent/. Prefs replace the a-Shell
-# torrent_prefs.json; paths stored here are valid iSH paths (root's home, where
-# rtorrent's download directories also live), not iOS Files paths.
+# All app files live under ~/gctorrent/. settings.json holds user preferences
+# (the save path, the dashboard poll rate, and whatever we add later); paths
+# stored here are valid iSH paths (root's home, where rtorrent's download
+# directories also live), not iOS Files paths.
 APP_DIR = os.path.expanduser("~/gctorrent")
 STATE_DIR = os.path.join(APP_DIR, "state")
-PREFS_PATH = os.path.join(APP_DIR, "prefs.json")
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+
+# Dashboard poll rate bounds (milliseconds). DEFAULT is what /settings reports
+# when nothing is stored yet; the clamp matches dashboard.js's own 0.1s..1h range.
+DEFAULT_POLL_MS = 1000
+MIN_POLL_MS = 100
+MAX_POLL_MS = 3600000
 
 # Sentinel for "maintenance mode": while this file exists, work.sh keeps the
 # bridge up but does NOT start rtorrent, so iSH opens to a shell prompt (even
@@ -297,18 +304,29 @@ def do_remove(h, delete_file):
             os.remove(directory)
 
 
-def read_prefs():
+def read_settings():
     try:
-        with open(PREFS_PATH) as f:
+        with open(SETTINGS_PATH) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def write_prefs(prefs):
+def write_settings(settings):
     os.makedirs(APP_DIR, exist_ok=True)
-    with open(PREFS_PATH, "w") as f:
-        json.dump(prefs, f)
+    with open(SETTINGS_PATH, "w") as f:
+        json.dump(settings, f)
+
+
+def clamp_poll_ms(value):
+    """Coerce a poll-rate value (number or numeric string) to an int clamped to
+    [MIN_POLL_MS, MAX_POLL_MS]. Returns None if it isn't a usable number, so the
+    caller can leave the stored value untouched."""
+    try:
+        ms = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return max(MIN_POLL_MS, min(MAX_POLL_MS, ms))
 
 
 # --- HTTP layer --------------------------------------------------------------
@@ -352,8 +370,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/status":
                 short = parse_qs(parsed.query).get("short", [None])[0]
                 self._send_json({"ok": True, "torrents": get_status(short)})
-            elif path == "/prefs":
-                self._send_json({"ok": True, "lastPath": read_prefs().get("lastPath", "")})
+            elif path == "/settings":
+                settings = read_settings()
+                self._send_json({
+                    "ok": True,
+                    "lastPath": settings.get("lastPath", ""),
+                    "pollMs": settings.get("pollMs", DEFAULT_POLL_MS),
+                })
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
         except RuntimeError as e:
@@ -397,10 +420,17 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 do_remove(h, as_bool(data.get("deleteFile", False)))
                 self._send_json({"ok": True})
-            elif self.path == "/prefs":
-                prefs = read_prefs()
-                prefs["lastPath"] = data.get("lastPath", "")
-                write_prefs(prefs)
+            elif self.path == "/settings":
+                # Partial update: only the keys present in the body change, so
+                # saving the path doesn't clobber the poll rate and vice versa.
+                settings = read_settings()
+                if "lastPath" in data:
+                    settings["lastPath"] = data["lastPath"]
+                if "pollMs" in data:
+                    ms = clamp_poll_ms(data["pollMs"])
+                    if ms is not None:
+                        settings["pollMs"] = ms
+                write_settings(settings)
                 self._send_json({"ok": True})
             elif self.path == "/detach":
                 do_detach()
@@ -572,9 +602,15 @@ if ! grep -q 'gctorrent/autostart.sh' /root/.profile 2>/dev/null; then
     echo '[ -f /root/gctorrent/autostart.sh ] && . /root/gctorrent/autostart.sh' >> /root/.profile
 fi
 
-# Migrate prefs from the pre-reorg location so a saved save-path survives.
-if [ -f /root/.torrent_prefs.json ] && [ ! -f /root/gctorrent/prefs.json ]; then
-    mv /root/.torrent_prefs.json /root/gctorrent/prefs.json
+# Migrate saved settings into gctorrent/settings.json from either older location
+# (pre-reorg ~/.torrent_prefs.json, or the short-lived gctorrent/prefs.json) so a
+# saved save-path/poll rate survives. First existing source wins; never clobber.
+if [ ! -f /root/gctorrent/settings.json ]; then
+    if [ -f /root/gctorrent/prefs.json ]; then
+        mv /root/gctorrent/prefs.json /root/gctorrent/settings.json
+    elif [ -f /root/.torrent_prefs.json ]; then
+        mv /root/.torrent_prefs.json /root/gctorrent/settings.json
+    fi
 fi
 
 # Carry the location grant forward so autostart keeps working without re-granting.
@@ -584,7 +620,8 @@ fi
 
 # Remove pre-reorg orphans now that everything lives under /root/gctorrent/.
 rm -f /root/bridge.py /root/work.sh /root/.torrent_autostart.sh \
-      /root/.location_check /root/.location_always_confirmed /root/.torrent_prefs.json
+      /root/.location_check /root/.location_always_confirmed \
+      /root/.torrent_prefs.json /root/gctorrent/prefs.json
 
 # A (re)install means "return to normal": clear any maintenance flag so the next
 # iSH launch autostarts the backend again, and drop the readiness marker so the
