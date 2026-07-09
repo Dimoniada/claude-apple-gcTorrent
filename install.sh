@@ -154,13 +154,13 @@ def get_status(short=None):
     short = short.lower() if short else None
     fields = (
         "d.hash=", "d.name=", "d.is_open=", "d.is_active=", "d.state=",
-        "d.complete=", "d.down.rate=", "d.up.rate=", "d.message=",
+        "d.hashing=", "d.complete=", "d.down.rate=", "d.up.rate=", "d.message=",
         "d.bytes_done=", "d.size_bytes=",
     )
     rows = scgi_call("d.multicall2", ("", "main") + fields)
     torrents = []
     for row in rows or []:
-        h, name, is_open, is_active, state, complete, down_rate, up_rate, message, done, size = row
+        h, name, is_open, is_active, state, hashing, complete, down_rate, up_rate, message, done, size = row
         if short and h[:6].lower() != short:
             continue
         downloading = int(down_rate) > 0
@@ -168,6 +168,12 @@ def get_status(short=None):
 
         if message:
             status = "ERROR"
+        elif int(hashing):
+            # rtorrent is verifying pieces (d.hashing != 0), e.g. after adding a
+            # torrent over existing data or a manual recheck. Reported before the
+            # paused/rate branches so it doesn't look IDLE while it's busy — no
+            # network transfer happens during a check, so rates are 0.
+            status = "CHECKING"
         elif not int(state) or not int(is_active):
             # Stopped (d.stop -> state 0) or paused (is_active 0). Checked before
             # the rate branches so a just-paused torrent reports PAUSED at once,
