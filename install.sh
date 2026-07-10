@@ -37,9 +37,12 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /ping                                  -> {"ok": true, "detached": bool}
     GET  /status                                -> {"ok": true, "torrents": [...]}
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
+      each torrent includes a "label": "<icon> (<pct>%) <name> (#<shortHash>)"
     GET  /settings                              -> {"ok": true, "lastPath": "<str>", "pollMs": <int>}
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
-    POST /add     {"data":<base64 .torrent>, "directory":...} -> {"ok": true}
+    POST /add     {"data":<base64>, "directory":...} -> {"ok": true}
+      data is base64 of EITHER a magnet/HTTP link OR a .torrent file; the bridge
+      auto-detects which, so the Shortcut can always base64 its input.
     POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.stop)
     POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.start)
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
@@ -148,6 +151,13 @@ def scgi_call(method, params=()):
 
 # --- command logic (copied verbatim from the retired rtorrent_rpc.py) --------
 
+# status -> emoji for the ready-made `label` row. Mirrors dashboard.js's icons.
+STATUS_ICONS = {
+    "DOWNLOADING": "⬇️", "UPLOADING": "⬆️", "DOWNLOADING&UPLOADING": "↕️",
+    "DONE": "✅", "CHECKING": "🔍", "PAUSED": "⏸️", "IDLE": "⏳", "ERROR": "⚠️",
+}
+
+
 def get_status(short=None):
     # `short`, if given, is a shortHash prefix (first 6 hex of the info-hash).
     # rtorrent only knows the full 40-char hash, so we filter here in the bridge.
@@ -192,16 +202,24 @@ def get_status(short=None):
             status = "IDLE"
 
         percent = round(100 * int(done) / int(size), 1) if int(size) else 0
+        short_hash = h[:6].lower()
+        # Ready-made menu row so the Shortcut can list torrents without building
+        # the string itself: "<icon> (<percent>%) <name> (#<shortHash>)". The
+        # trailing (#<shortHash>) is what the Shortcut regex reads back on tap.
+        label = "%s (%g%%) %s (#%s)" % (
+            STATUS_ICONS.get(status, "•"), percent, name, short_hash,
+        )
 
         torrents.append({
             "hash": h,
-            "shortHash": h[:6].lower(),
+            "shortHash": short_hash,
             "name": name,
             "status": status,
             "message": message,
             "downRate": int(down_rate),
             "upRate": int(up_rate),
             "percent": percent,
+            "label": label,
         })
     return torrents
 
@@ -230,27 +248,39 @@ def do_add(url, directory):
 
 
 def do_add_raw(data_b64, directory):
-    """Load a .torrent from its raw bytes (base64) rather than a link — used when
-    the Shortcut passes the file itself (clipboard file / Share Sheet). rtorrent's
-    load.raw_start takes the bencoded content directly. Non-base64 chars (e.g. the
-    line breaks Shortcuts may add) are discarded by b64decode's default mode."""
+    """Add whatever the Shortcut base64-encoded, auto-detecting the kind: a
+    magnet/HTTP link (base64 of the text) OR a .torrent file (base64 of its
+    bytes). This lets the Shortcut always base64 its input and POST it as `data`,
+    with no magnet-vs-file branch of its own. Non-base64 chars (e.g. line breaks
+    Shortcuts may add) are dropped by b64decode's default mode. Raises
+    RuntimeError("INVALID_LINK") if it's neither a link nor a bencoded .torrent."""
     try:
         raw = base64.b64decode(data_b64 or "")
     except (ValueError, TypeError):
-        log("add rejected (undecodable base64 .torrent data)")
-        raise RuntimeError("INVALID_LINK")
-    # A bencoded .torrent is a dict, so it starts with 'd' and ends with 'e'.
-    if not (raw[:1] == b"d" and raw[-1:] == b"e"):
-        log("add rejected (not a valid .torrent: %d bytes)" % len(raw))
+        log("add rejected (undecodable base64 data)")
         raise RuntimeError("INVALID_LINK")
 
-    os.makedirs(os.path.expanduser(directory), exist_ok=True)
-    log("add: loading %d-byte .torrent file into %s" % (len(raw), directory))
-    result = scgi_call(
-        "load.raw_start",
-        ("", Binary(raw), f'd.directory.set="{directory}"'),
-    )
-    log("add: rtorrent load.raw_start returned %r" % (result,))
+    # A magnet/HTTP link decodes back to that text — hand it to do_add, which
+    # validates it and calls load.start.
+    stripped = raw.lstrip()
+    low = stripped[:8].lower()
+    if low.startswith(b"magnet:") or low.startswith(b"http"):
+        do_add(stripped.decode("utf-8", "replace").strip(), directory)
+        return
+
+    # Otherwise it must be a bencoded .torrent (a dict: starts 'd', ends 'e').
+    if raw[:1] == b"d" and raw[-1:] == b"e":
+        os.makedirs(os.path.expanduser(directory), exist_ok=True)
+        log("add: loading %d-byte .torrent file into %s" % (len(raw), directory))
+        result = scgi_call(
+            "load.raw_start",
+            ("", Binary(raw), f'd.directory.set="{directory}"'),
+        )
+        log("add: rtorrent load.raw_start returned %r" % (result,))
+        return
+
+    log("add rejected (not a link or .torrent: %d bytes)" % len(raw))
+    raise RuntimeError("INVALID_LINK")
 
 
 def do_detach():
