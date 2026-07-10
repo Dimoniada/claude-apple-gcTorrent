@@ -202,6 +202,11 @@ def get_status(short=None):
             status = "IDLE"
 
         percent = round(100 * int(done) / int(size), 1) if int(size) else 0
+        # A paused torrent isn't transferring, but rtorrent keeps returning the
+        # last d.down.rate/d.up.rate after d.stop — which would freeze a stale
+        # speed on the dashboard forever. Report 0 for a paused torrent.
+        rep_down = 0 if status == "PAUSED" else int(down_rate)
+        rep_up = 0 if status == "PAUSED" else int(up_rate)
         short_hash = h[:6].lower()
         # Ready-made menu row so the Shortcut can list torrents without building
         # the string itself: "<icon> (<percent>%) <name> (#<shortHash>)". The
@@ -216,8 +221,8 @@ def get_status(short=None):
             "name": name,
             "status": status,
             "message": message,
-            "downRate": int(down_rate),
-            "upRate": int(up_rate),
+            "downRate": rep_down,
+            "upRate": rep_up,
             "percent": percent,
             "label": label,
         })
