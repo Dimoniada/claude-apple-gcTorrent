@@ -41,6 +41,7 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
       each torrent includes a "label": "<icon> (<pct>%) <name> (#<shortHash>)"
     GET  /settings                              -> {"ok": true, "lastPath": "<str>", "pollMs": <int>}
+    GET  /help/downloads.gif                     -> image/gif (the "find downloads" help clip)
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
     POST /add     {"data":<base64>, "directory":...} -> {"ok": true}
       data is base64 of EITHER a magnet/HTTP link OR a .torrent file; the bridge
@@ -86,6 +87,9 @@ BRIDGE_PORT = 5001
 APP_DIR = os.path.expanduser("~/gctorrent")
 STATE_DIR = os.path.join(APP_DIR, "state")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+# "How to find your downloads folder" help clip, fetched by install.sh and
+# served over loopback so the Shortcut's Help menu can Quick Look it.
+HELP_GIF_PATH = os.path.join(APP_DIR, "howto_downloads.gif")
 
 # Dashboard poll rate bounds (milliseconds). DEFAULT is what /settings reports
 # when nothing is stored yet; the clamp matches dashboard.js's own 0.1s..1h range.
@@ -429,6 +433,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, path, content_type):
+        """Stream a static file (e.g. the help GIF) with the given MIME type.
+        Falls back to a JSON 404 if the file is missing — the help clip is
+        optional (install.sh may have failed to fetch it)."""
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _read_body(self):
         """Parse the JSON request body. Raises ValueError on malformed input."""
         length = int(self.headers.get("Content-Length", 0))
@@ -469,6 +490,9 @@ class Handler(BaseHTTPRequestHandler):
                     "lastPath": settings.get("lastPath", ""),
                     "pollMs": settings.get("pollMs", DEFAULT_POLL_MS),
                 })
+            elif path == "/help/downloads.gif":
+                # Static help clip for the Shortcut's Help menu (Quick Look).
+                self._send_file(HELP_GIF_PATH, "image/gif")
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
         except RuntimeError as e:
@@ -661,6 +685,15 @@ done
 echo "[1/4] installing packages (python3, rtorrent)..."
 apk update
 apk add python3 rtorrent
+
+# Fetch the "how to find your downloads folder" help clip. The bridge serves
+# it over loopback at GET /help/downloads.gif and the Shortcut's Help menu shows
+# it via Quick Look. Non-fatal: if this download fails the app is unaffected —
+# only the Help clip is missing (the endpoint then returns 404).
+echo "  fetching help clip (howto_downloads.gif)..."
+wget -qO /root/gctorrent/howto_downloads.gif \
+  https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/howto_downloads.gif \
+  || echo "  (help clip download skipped)"
 
 echo "[2/4] directories + .rtorrent.rc..."
 mkdir -p /root/downloads /root/.session
