@@ -50,7 +50,9 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /detach                                -> {"ok": true}
     POST /attach                                -> {"ok": true}
 
-Error codes: DAEMON_UNREACHABLE, INVALID_LINK, BAD_REQUEST, NOT_FOUND.
+Error codes: DAEMON_UNREACHABLE, DAEMON_BUSY, INVALID_LINK, BAD_REQUEST, NOT_FOUND.
+(DAEMON_BUSY = connected but rtorrent didn't answer in time, i.e. alive but
+pinned hash-checking; the Shortcut treats it as "wait a moment and re-run".)
 
 No third-party packages are used — only the Python standard library — so
 `apk add python3` is the only iSH-side dependency.
@@ -111,9 +113,15 @@ def log(*args):
 def scgi_call(method, params=()):
     """Send a single XML-RPC call over the SCGI protocol to rtorrent.
 
-    Raises RuntimeError("DAEMON_UNREACHABLE") on any socket failure — same
-    contract the retired rtorrent_rpc.py used, so callers map it straight to a
-    JSON error.
+    Raises RuntimeError with one of two codes so callers can tell the states
+    apart:
+      * "DAEMON_UNREACHABLE" — the connect was refused (or otherwise failed),
+        i.e. nothing is listening on the SCGI port: rtorrent is down or still
+        coming up.
+      * "DAEMON_BUSY" — we connected fine but rtorrent didn't answer within the
+        timeout. Its single main loop is alive but pinned (almost always mid
+        hash-check on iSH's slow CPU), so this is a transient "try again in a
+        moment", not a crash. The Shortcut surfaces it as a wait-and-retry.
     """
     payload = dumps(params, methodname=method).encode("utf-8")
     headers = "CONTENT_LENGTH\x00%d\x00SCGI\x001\x00" % len(payload)
@@ -132,7 +140,16 @@ def scgi_call(method, params=()):
             if not chunk:
                 break
             chunks.append(chunk)
-    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+    except socket.timeout as e:
+        # Connecting to loopback succeeds instantly unless nothing is listening
+        # (that raises ConnectionRefused, below), so a timeout here means
+        # rtorrent accepted the socket but is too busy to answer in time —
+        # alive, just pinned (hash-checking). Report it distinctly so the
+        # Shortcut can say "busy, wait a moment and re-run" instead of failing.
+        if method != "d.multicall2":
+            log("rtorrent call %s timed out: %s (busy hash-checking?)" % (method, e))
+        raise RuntimeError("DAEMON_BUSY") from e
+    except (ConnectionRefusedError, OSError) as e:
         # Skip the high-frequency status poll (d.multicall2) so a down rtorrent
         # being polled by the dashboard doesn't flood the log; still record the
         # user-initiated calls (add/pause/remove/ping) that we want to trace.
@@ -427,6 +444,9 @@ class Handler(BaseHTTPRequestHandler):
                     scgi_call("system.pid")
                     self._send_json({"ok": True, "detached": detached})
                 except RuntimeError as e:
+                    # DAEMON_BUSY (pinned/hash-checking) and DAEMON_UNREACHABLE
+                    # (down) both surface as the error code; the Shortcut tells
+                    # them apart — BUSY means "wait a moment and re-run".
                     self._send_json({"ok": False, "detached": detached, "error": str(e)})
             elif path == "/status":
                 short = parse_qs(parsed.query).get("short", [None])[0]
