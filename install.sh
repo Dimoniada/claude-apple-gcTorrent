@@ -41,7 +41,7 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
       each torrent includes a "label": "<icon> (<pct>%) <name> (#<shortHash>)"
     GET  /settings                              -> {"ok": true, "lastPath": "<str>", "pollMs": <int>}
-    GET  /help/downloads.gif                     -> image/gif (the "find downloads" help clip)
+    GET  /help/howto_downloads.gif               -> image/gif (the "find downloads" help clip)
     POST /add     {"url":..., "directory":...}  -> {"ok": true}
     POST /add     {"data":<base64>, "directory":...} -> {"ok": true}
       data is base64 of EITHER a magnet/HTTP link OR a .torrent file; the bridge
@@ -490,8 +490,9 @@ class Handler(BaseHTTPRequestHandler):
                     "lastPath": settings.get("lastPath", ""),
                     "pollMs": settings.get("pollMs", DEFAULT_POLL_MS),
                 })
-            elif path == "/help/downloads.gif":
+            elif path == "/help/howto_downloads.gif":
                 # Static help clip for the Shortcut's Help menu (Quick Look).
+                # Route mirrors the on-disk filename (HELP_GIF_PATH).
                 self._send_file(HELP_GIF_PATH, "image/gif")
             else:
                 self._send_json({"ok": False, "error": "NOT_FOUND"}, status=404)
