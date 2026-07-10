@@ -34,7 +34,9 @@ plain-text pipeline has been retired — everything (ping, list, add, pause,
 remove, prefs) goes through the endpoints below and returns JSON.
 
 Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
-    GET  /ping                                  -> {"ok": true, "detached": bool}
+    GET  /ping                                  -> {"ok": true}
+      not-running states come back as {"ok": false, "error": <CODE>} where CODE
+      is DETACHED (maintenance) / DAEMON_BUSY (hash-checking) / DAEMON_UNREACHABLE.
     GET  /status                                -> {"ok": true, "torrents": [...]}
     GET  /status?short=<6hex>                    -> {"ok": true, "torrents": [<0 or 1>]}
       each torrent includes a "label": "<icon> (<pct>%) <name> (#<shortHash>)"
@@ -50,9 +52,12 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /detach                                -> {"ok": true}
     POST /attach                                -> {"ok": true}
 
-Error codes: DAEMON_UNREACHABLE, DAEMON_BUSY, INVALID_LINK, BAD_REQUEST, NOT_FOUND.
+Error codes: DAEMON_UNREACHABLE, DAEMON_BUSY, DETACHED, INVALID_LINK,
+BAD_REQUEST, NOT_FOUND.
 (DAEMON_BUSY = connected but rtorrent didn't answer in time, i.e. alive but
-pinned hash-checking; the Shortcut treats it as "wait a moment and re-run".)
+pinned hash-checking; the Shortcut treats it as "wait a moment and re-run".
+DETACHED = maintenance mode: rtorrent is intentionally off but the bridge still
+answers /ping.)
 
 No third-party packages are used — only the Python standard library — so
 `apk add python3` is the only iSH-side dependency.
@@ -313,7 +318,7 @@ def do_detach():
 
     Writes the ~/.detached sentinel that work.sh checks, so rtorrent stays stopped
     across iSH restarts (the bridge itself keeps running, so /ping still answers
-    and reports detached=true). do_attach / a reinstall removes the sentinel to
+    and reports error=DETACHED). do_attach / a reinstall removes the sentinel to
     resume. Then SIGTERM rtorrent (clean session save); -x matches the exact
     process name, like the autostart guard does.
 
@@ -437,17 +442,23 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path
             if path == "/ping":
-                # Report maintenance mode regardless of rtorrent's state, so the
-                # Shortcut can tell "detached on purpose" from "rtorrent crashed".
-                detached = os.path.exists(DETACH_FLAG)
-                try:
-                    scgi_call("system.pid")
-                    self._send_json({"ok": True, "detached": detached})
-                except RuntimeError as e:
-                    # DAEMON_BUSY (pinned/hash-checking) and DAEMON_UNREACHABLE
-                    # (down) both surface as the error code; the Shortcut tells
-                    # them apart — BUSY means "wait a moment and re-run".
-                    self._send_json({"ok": False, "detached": detached, "error": str(e)})
+                # All "not fully running" states report through the single error
+                # field so the Shortcut switches on one value:
+                #   DETACHED           -> maintenance mode (rtorrent off on
+                #                         purpose); the bridge still answers.
+                #   DAEMON_BUSY        -> rtorrent alive but pinned (hash-check);
+                #                         wait a moment and re-run.
+                #   DAEMON_UNREACHABLE -> rtorrent down/crashed; start it.
+                # Detach means rtorrent is intentionally down, so skip the
+                # (doomed, 5s) scgi_call and report it straight away.
+                if os.path.exists(DETACH_FLAG):
+                    self._send_json({"ok": False, "error": "DETACHED"})
+                else:
+                    try:
+                        scgi_call("system.pid")
+                        self._send_json({"ok": True})
+                    except RuntimeError as e:
+                        self._send_json({"ok": False, "error": str(e)})
             elif path == "/status":
                 short = parse_qs(parsed.query).get("short", [None])[0]
                 self._send_json({"ok": True, "torrents": get_status(short)})
@@ -575,7 +586,7 @@ touch "$FLAG_FILE"
 # Start the status bridge FIRST and unconditionally (guarded so we never run a
 # second copy). Keeping it up whenever iSH is open lets the Shortcut always reach
 # 127.0.0.1:5001 — even with rtorrent down or in maintenance mode — so /ping
-# answers (ok:false / detached) instead of refusing the connection and
+# answers (ok:false, error:DETACHED) instead of refusing the connection and
 # hard-halting the Shortcut.
 if ! pgrep -f "python3 $APP_DIR/bridge.py" >/dev/null 2>&1; then
     # Clear any stale readiness marker so the wait before rtorrent tracks THIS
