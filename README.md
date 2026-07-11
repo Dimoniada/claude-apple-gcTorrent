@@ -1,6 +1,6 @@
 # claude-apple-gcTorrent
 
-https://www.icloud.com/shortcuts/7acd2a94bf87412da9d5a707f6d7e3d4
+https://www.icloud.com/shortcuts/4a9374bea11342a5b6f6e3c776ce2317
 
 **A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app — driven by an iOS Shortcut.**
 
