@@ -683,9 +683,33 @@ for f in bridge.py work.sh; do
     fi
 done
 
+# apk over iSH's emulated network is flaky — a single dropped index or package
+# fetch returns non-zero and, under `set -e`, would abort the whole install
+# (seen as "DNS lookup error" or "network error (check Internet connection...)").
+# Retry transient failures a few times before giving up. apk exits 1 for every
+# kind of error, so we can't tell "network blip" from "no such package" by exit
+# code — but the package set below is fixed and valid, so the only realistic
+# failure IS the network, and retry-on-failure never masks a real bug: a genuine
+# permanent error just exhausts the attempts and fails with the same message.
+apk_retry() {
+    n=0
+    until apk "$@"; do
+        n=$((n + 1))
+        if [ "$n" -ge 4 ]; then
+            echo "apk $* failed after $n attempts — check the connection and re-run."
+            return 1
+        fi
+        echo "  apk failed (attempt $n) — retrying in 3s..."
+        sleep 3
+    done
+}
+
 echo "[1/4] installing packages (python3, rtorrent)..."
-apk update
-apk add python3 rtorrent
+# update is best-effort: if the index refresh ultimately fails but a cached
+# index exists, `apk add` can still install from it. add MUST succeed, so its
+# failure stays fatal (set -e aborts) — there's no app without the packages.
+apk_retry update || true
+apk_retry add python3 rtorrent
 
 # Fetch the "how to find your downloads folder" help clip. The bridge serves
 # it over loopback at GET /help/downloads.gif and the Shortcut's Help menu shows
