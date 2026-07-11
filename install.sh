@@ -776,6 +776,17 @@ apk_retry() {
     done
 }
 
+# Guarantee a working DNS resolver before any fetch. iSH fills /etc/resolv.conf
+# from the network, but some networks — a PC or phone hotspot especially — hand
+# it a DNS server it can't actually reach, so every lookup fails ("could not
+# resolve host") and the apk/wget fetches below die before they start. Append
+# Google's public resolver as a *fallback* rather than overwriting: iSH runs on
+# musl libc, whose resolver queries all listed nameservers in parallel and takes
+# the first reply — so a working network DNS is unaffected (it still answers
+# first) while a dead hotspot resolver is transparently bypassed. Idempotent.
+grep -qsF 'nameserver 8.8.8.8' /etc/resolv.conf \
+  || echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+
 echo "[1/4] installing packages (python3, rtorrent)..."
 # update is best-effort: if the index refresh ultimately fails but a cached
 # index exists, `apk add` can still install from it. add MUST succeed, so its

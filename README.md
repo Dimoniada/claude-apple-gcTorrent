@@ -61,7 +61,7 @@ cd /root && apk update && apk add ca-certificates wget && \
 
 `install.sh` extracts the scripts to `~/gctorrent/`, installs the packages, and starts everything (it `exec`s `work.sh` at the end). On later launches the `.profile` autostart hook starts the stack automatically — nothing to type. Grant the **Location → Always** prompt on first run.
 
-> **Flaky iSH networking?** apk fetches can drop ("DNS lookup error" / "network error"). The installer retries transient failures automatically; if it still fails, toggle Airplane mode or set a resolver (`echo "nameserver 1.1.1.1" > /etc/resolv.conf`) and re-run.
+> **Flaky iSH networking?** apk fetches can drop ("DNS lookup error" / "network error" / "could not resolve host"). The installer retries transient failures automatically and appends a public DNS fallback (`8.8.8.8`) so lookups keep working even when the network — a PC/phone hotspot especially — hands iSH an unreachable resolver. If it still fails, toggle Airplane mode or set a resolver manually (`echo "nameserver 8.8.8.8" > /etc/resolv.conf`) and re-run.
 
 ### Get the Shortcut
 
