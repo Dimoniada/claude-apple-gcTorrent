@@ -230,13 +230,16 @@ def get_status(short=None):
             status = "DOWNLOADING"
         elif uploading:
             status = "UPLOADING"
+        elif message:
+            # d.message is mostly a sticky *tracker* note ("unable to connect to
+            # UDP tracker" and the like) that rtorrent leaves on the torrent and
+            # never clears on its own — it's non-fatal and coexists with a healthy
+            # download (DHT/PEX/other trackers). So only report ERROR when the
+            # torrent is otherwise idle: stalled, with a message explaining why.
+            # The message stays on the torrent object regardless, so the UI can
+            # still surface it as a warning while downloading.
+            status = "ERROR"
         else:
-            # Not checking, paused, transferring, or complete → just idle, waiting
-            # for peers. A lingering d.message here is almost always a non-fatal,
-            # sticky tracker note ("unable to connect to UDP tracker") that
-            # rtorrent never clears on its own — it doesn't mean the torrent
-            # failed, so it stays IDLE rather than flipping to a false ERROR. The
-            # message still travels on the torrent object as an informational note.
             status = "IDLE"
 
         percent = round(100 * int(done) / int(size), 1) if int(size) else 0
