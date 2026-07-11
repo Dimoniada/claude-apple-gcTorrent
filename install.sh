@@ -72,6 +72,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -336,6 +337,117 @@ def resolve_directory(directory):
     return os.path.normpath(d)
 
 
+# --- magnet directory reconciliation (rtorrent bug rakshasa/rtorrent#376) -----
+#
+# A magnet loaded with d.directory.set keeps that directory only on its temporary
+# <hash>.meta download. Once the metadata resolves, rtorrent reloads the torrent
+# from the fetched .torrent and drops d.directory back to directory.default — so
+# the folder the user picked is created but stays empty while the data lands in
+# /root/downloads. (.torrent-file adds don't hit this; their directory sticks.)
+#
+# We remember each magnet's intended directory by info-hash and a background
+# thread re-applies it (stop -> d.directory.set -> start) the moment the magnet
+# resolves. In-memory only: a bridge restart mid-resolution forgets the intent
+# (rare — the user can re-add).
+RECONCILE_INTERVAL = 2      # seconds between reconcile passes
+RECONCILE_MAX_TRIES = 5     # stop re-trying a stubborn one after this many passes
+_pending_lock = threading.Lock()
+_pending_magnets = {}       # info-hash (40-hex upper) -> {"dir": <abs>, "tries": int}
+
+
+def magnet_infohash(url):
+    """The BitTorrent info-hash from a magnet's xt=urn:btih:<hash>, as uppercase
+    40-char hex (rtorrent's d.hash form), or None if absent/unparseable. Accepts
+    both the 40-char hex and 32-char base32 encodings."""
+    for xt in parse_qs(urlparse(url).query).get("xt", []):
+        prefix = "urn:btih:"
+        if not xt.startswith(prefix):
+            continue
+        h = xt[len(prefix):].strip()
+        if len(h) == 40:
+            try:
+                int(h, 16)
+                return h.upper()
+            except ValueError:
+                return None
+        if len(h) == 32:
+            try:
+                return base64.b32decode(h.upper()).hex().upper()
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def track_magnet(url, directory):
+    """Remember a just-added magnet's intended (already absolute) directory so the
+    reconciler can restore it after rtorrent reverts it on metadata resolution."""
+    ih = magnet_infohash(url)
+    if not ih:
+        return
+    with _pending_lock:
+        _pending_magnets[ih] = {"dir": directory, "tries": 0}
+    log("add: tracking magnet %s -> %s for directory reconcile" % (ih, directory))
+
+
+def reconcile_pending_magnets():
+    """One reconcile pass: for each tracked magnet, once rtorrent has resolved the
+    metadata re-apply the user's directory if rtorrent reverted it, then stop
+    tracking it. Best-effort — rtorrent being down/busy is ignored and retried
+    next pass.
+
+    "Resolved" is detected by name, not size: while a magnet is still fetching its
+    metadata rtorrent lists it as the placeholder "<HASH>.meta" (and reports a
+    dummy d.size_bytes of 1, so size is no signal). The directory revert we're
+    fixing only happens when that placeholder is replaced by the real torrent, so
+    we must keep tracking until the ".meta" name is gone."""
+    with _pending_lock:
+        pending = list(_pending_magnets.items())  # inner dicts are shared refs
+    if not pending:
+        return
+    try:
+        rows = scgi_call("d.multicall2",
+                         ("", "main", "d.hash=", "d.name=", "d.directory="))
+    except RuntimeError:
+        return  # rtorrent down/busy — try again next pass
+    current = {r[0].upper(): (r[1], r[2]) for r in (rows or [])}
+    done = []
+    for ih, info in pending:
+        if ih not in current:
+            done.append(ih)                       # removed before it resolved
+            continue
+        name, cur_dir = current[ih]
+        if name.lower().endswith(".meta"):
+            continue                              # metadata not resolved yet
+        want = info["dir"]
+        if os.path.normpath(cur_dir) == os.path.normpath(want):
+            done.append(ih)                       # already correct — nothing to do
+            continue
+        try:
+            scgi_call("d.stop", (ih,))
+            scgi_call("d.directory.set", (ih, want))
+            scgi_call("d.start", (ih,))
+            log("reconcile: moved magnet %s to %s (was %s)" % (ih, want, cur_dir))
+            done.append(ih)
+        except RuntimeError:
+            info["tries"] += 1                    # mutates the shared registry dict
+            if info["tries"] >= RECONCILE_MAX_TRIES:
+                log("reconcile: giving up on magnet %s after %d tries"
+                    % (ih, info["tries"]))
+                done.append(ih)
+    with _pending_lock:
+        for ih in done:
+            _pending_magnets.pop(ih, None)
+
+
+def reconcile_loop():
+    while True:
+        time.sleep(RECONCILE_INTERVAL)
+        try:
+            reconcile_pending_magnets()
+        except Exception as e:  # noqa: BLE001 - never let the reconciler thread die
+            log("reconcile loop error: %s" % e)
+
+
 def do_add(url, directory):
     """Validate + load a magnet/.torrent link into rtorrent. Raises
     RuntimeError("INVALID_LINK") (not a magnet/http link),
@@ -374,6 +486,9 @@ def do_add(url, directory):
         ("", url, f'd.directory.set="{directory}"'),
     )
     log("add: rtorrent load.start returned %r" % (result,))
+    # rtorrent drops d.directory when the magnet's metadata resolves (bug #376),
+    # so remember the intended folder for the reconciler to restore.
+    track_magnet(url, directory)
 
 
 def do_add_raw(data_b64, directory):
@@ -681,6 +796,10 @@ if __name__ == "__main__":
     atexit.register(
         lambda: os.path.exists(READY_FLAG) and os.remove(READY_FLAG)
     )
+    # Background thread that restores a magnet's chosen directory after rtorrent
+    # reverts it on metadata resolution (bug #376). Daemon so it dies with us.
+    threading.Thread(target=reconcile_loop, daemon=True).start()
+    log("magnet directory reconciler started")
     log(f"bridge.py listening on {RTORRENT_HOST}:{BRIDGE_PORT}")
     server.serve_forever()
 __GCTORRENT_BRIDGE_PY__
