@@ -204,9 +204,7 @@ def get_status(short=None):
         downloading = int(down_rate) > 0
         uploading = int(up_rate) > 0
 
-        if message:
-            status = "ERROR"
-        elif int(hashing):
+        if int(hashing):
             # rtorrent is verifying pieces (d.hashing != 0), e.g. after adding a
             # torrent over existing data or a manual recheck. Reported before the
             # paused/rate branches so it doesn't look IDLE while it's busy — no
@@ -226,6 +224,15 @@ def get_status(short=None):
             status = "UPLOADING"
         elif int(complete):
             status = "DONE"
+        elif message:
+            # d.message is mostly a sticky *tracker* note ("unable to connect to
+            # UDP tracker" and the like) that rtorrent leaves on the torrent and
+            # never clears on its own — it's non-fatal and coexists with a healthy
+            # download (DHT/PEX/other trackers). So only report ERROR when the
+            # torrent is otherwise idle: stalled, with a message explaining why.
+            # The message stays on the torrent object regardless, so the UI can
+            # still surface it as a warning while downloading.
+            status = "ERROR"
         else:
             status = "IDLE"
 
