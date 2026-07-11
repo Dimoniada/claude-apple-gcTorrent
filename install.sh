@@ -311,12 +311,38 @@ def fetch_torrent(url):
     return data
 
 
+# Base for a bare/relative destination — matches directory.default.set in
+# ~/.rtorrent.rc, so a subfolder name lands under the same downloads root.
+DOWNLOAD_ROOT = "/root/downloads"
+
+
+def resolve_directory(directory):
+    """Normalise the Shortcut's destination into ONE absolute path, used both to
+    create the folder and to tell rtorrent where to save — so the two can never
+    resolve to different places. A bare/relative subfolder is anchored under
+    DOWNLOAD_ROOT (a relative d.directory would otherwise override
+    directory.default and land outside downloads), and ~ is expanded.
+
+    This matters across restarts: rtorrent stores d.directory in its session file
+    verbatim and, on the next launch, resolves a relative or ~ path against its
+    own current working directory — which iSH does not pin (work.sh starts
+    rtorrent with no cd). If that resolves anywhere other than where the data was
+    actually written, the recheck finds no chunks and the torrent comes back as
+    "Download registered as completed, but hash check returned unfinished
+    chunks." An absolute path removes the ambiguity."""
+    d = os.path.expanduser((directory or "").strip())
+    if not os.path.isabs(d):
+        d = os.path.join(DOWNLOAD_ROOT, d)
+    return os.path.normpath(d)
+
+
 def do_add(url, directory):
     """Validate + load a magnet/.torrent link into rtorrent. Raises
     RuntimeError("INVALID_LINK") (not a magnet/http link),
     RuntimeError("NOT_A_TORRENT") (http link that isn't a .torrent) or
     RuntimeError("DAEMON_UNREACHABLE")."""
     url = (url or "").strip()
+    directory = resolve_directory(directory)
     is_magnet = url.startswith("magnet:")
     is_torrent_url = url.startswith("http://") or url.startswith("https://")
     if not (is_magnet or is_torrent_url):
@@ -357,6 +383,7 @@ def do_add_raw(data_b64, directory):
     with no magnet-vs-file branch of its own. Non-base64 chars (e.g. line breaks
     Shortcuts may add) are dropped by b64decode's default mode. Raises
     RuntimeError("INVALID_LINK") if it's neither a link nor a bencoded .torrent."""
+    directory = resolve_directory(directory)
     try:
         raw = base64.b64decode(data_b64 or "")
     except (ValueError, TypeError):
