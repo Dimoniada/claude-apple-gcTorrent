@@ -216,31 +216,37 @@ def get_status(short=None):
             # instead of lingering as DOWNLOADING while rtorrent's rolling rate
             # decays to 0.
             status = "PAUSED"
+        elif int(complete):
+            # Complete → nothing left to fetch. rtorrent's d.down.rate is a
+            # rolling average that keeps decaying for a few seconds after the
+            # final piece, so a just-finished torrent would otherwise still report
+            # a phantom download rate and land in the DOWNLOADING branch below.
+            # Checked before the rate branches: UPLOADING while it's actively
+            # seeding, otherwise DONE (the stale down rate is zeroed further down).
+            status = "UPLOADING" if uploading else "DONE"
         elif downloading and uploading:
             status = "DOWNLOADING&UPLOADING"
         elif downloading:
             status = "DOWNLOADING"
         elif uploading:
             status = "UPLOADING"
-        elif int(complete):
-            status = "DONE"
-        elif message:
-            # d.message is mostly a sticky *tracker* note ("unable to connect to
-            # UDP tracker" and the like) that rtorrent leaves on the torrent and
-            # never clears on its own — it's non-fatal and coexists with a healthy
-            # download (DHT/PEX/other trackers). So only report ERROR when the
-            # torrent is otherwise idle: stalled, with a message explaining why.
-            # The message stays on the torrent object regardless, so the UI can
-            # still surface it as a warning while downloading.
-            status = "ERROR"
         else:
+            # Not checking, paused, transferring, or complete → just idle, waiting
+            # for peers. A lingering d.message here is almost always a non-fatal,
+            # sticky tracker note ("unable to connect to UDP tracker") that
+            # rtorrent never clears on its own — it doesn't mean the torrent
+            # failed, so it stays IDLE rather than flipping to a false ERROR. The
+            # message still travels on the torrent object as an informational note.
             status = "IDLE"
 
         percent = round(100 * int(done) / int(size), 1) if int(size) else 0
-        # A paused torrent isn't transferring, but rtorrent keeps returning the
-        # last d.down.rate/d.up.rate after d.stop — which would freeze a stale
-        # speed on the dashboard forever. Report 0 for a paused torrent.
-        rep_down = 0 if status == "PAUSED" else int(down_rate)
+        # A paused torrent isn't transferring, and a complete torrent has nothing
+        # left to download — but rtorrent keeps returning the last d.down.rate/
+        # d.up.rate (a rolling average that decays for seconds after d.stop or the
+        # final piece), which would otherwise freeze a stale speed on the
+        # dashboard. Report 0 down for a paused or complete torrent, and 0 up for
+        # a paused one.
+        rep_down = 0 if (int(complete) or status == "PAUSED") else int(down_rate)
         rep_up = 0 if status == "PAUSED" else int(up_rate)
         short_hash = h[:6].lower()
         # Ready-made menu row so the Shortcut can list torrents without building
