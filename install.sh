@@ -54,11 +54,12 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /attach                                -> {"ok": true}
 
 Error codes: DAEMON_UNREACHABLE, DAEMON_BUSY, DETACHED, INVALID_LINK,
-BAD_REQUEST, NOT_FOUND.
+NOT_A_TORRENT, BAD_REQUEST, NOT_FOUND.
 (DAEMON_BUSY = connected but rtorrent didn't answer in time, i.e. alive but
 pinned hash-checking; the Shortcut treats it as "wait a moment and re-run".
 DETACHED = maintenance mode: rtorrent is intentionally off but the bridge still
-answers /ping.)
+answers /ping. NOT_A_TORRENT = an http(s) link that didn't return a .torrent —
+a login page, 404, or wrong link; use a magnet or the .torrent file instead.)
 
 No third-party packages are used — only the Python standard library — so
 `apk add python3` is the only iSH-side dependency.
@@ -74,6 +75,7 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
+from urllib.request import Request, urlopen
 from xmlrpc.client import Binary, dumps, loads
 
 RTORRENT_HOST = "127.0.0.1"
@@ -255,9 +257,48 @@ def get_status(short=None):
     return torrents
 
 
+# Cap the metafile we'll pull from an http(s) link; matches the rtorrent
+# network.xmlrpc.size_limit so load.raw_start can't be handed something bigger.
+MAX_TORRENT_BYTES = 8 * 1024 * 1024
+FETCH_TIMEOUT = 10  # seconds; a dead/slow link fails fast off the UI path
+
+
+def looks_like_torrent(raw):
+    """A .torrent is a bencoded dict: starts 'd', and always carries the info
+    dict, encoded literally as b'4:info'. An HTML login page / error body starts
+    with '<' and has no such key, so this reliably tells the two apart without
+    trusting Content-Type."""
+    stripped = raw.lstrip()
+    return stripped[:1] == b"d" and b"4:info" in stripped
+
+
+def fetch_torrent(url):
+    """Download an http(s) link ourselves and return its bytes only if they are
+    actually a .torrent. Raises RuntimeError("NOT_A_TORRENT") on any fetch
+    failure OR non-torrent body (e.g. a tracker login page like rutracker's
+    dl.php). Doing the fetch here — instead of letting rtorrent load.start it
+    asynchronously — is what lets us report the failure at all: load.start
+    returns 0 ("queued") and then fails silently on non-torrent data."""
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 gctorrent"})
+    try:
+        with urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+            data = resp.read(MAX_TORRENT_BYTES + 1)
+    except Exception as e:  # noqa: BLE001 - URLError/HTTPError/timeout/TLS/etc.
+        log("add: fetch failed for %r: %s" % (url[:100], e))
+        raise RuntimeError("NOT_A_TORRENT")
+    if len(data) > MAX_TORRENT_BYTES:
+        log("add: %r exceeds %d bytes — refusing" % (url[:100], MAX_TORRENT_BYTES))
+        raise RuntimeError("NOT_A_TORRENT")
+    if not looks_like_torrent(data):
+        log("add: %r did not return a .torrent (%d bytes)" % (url[:100], len(data)))
+        raise RuntimeError("NOT_A_TORRENT")
+    return data
+
+
 def do_add(url, directory):
-    """Validate + load a magnet/.torrent into rtorrent. Copied from
-    rtorrent_rpc.py's cmd_add. Raises RuntimeError("INVALID_LINK") or
+    """Validate + load a magnet/.torrent link into rtorrent. Raises
+    RuntimeError("INVALID_LINK") (not a magnet/http link),
+    RuntimeError("NOT_A_TORRENT") (http link that isn't a .torrent) or
     RuntimeError("DAEMON_UNREACHABLE")."""
     url = (url or "").strip()
     is_magnet = url.startswith("magnet:")
@@ -267,14 +308,29 @@ def do_add(url, directory):
         raise RuntimeError("INVALID_LINK")
 
     os.makedirs(os.path.expanduser(directory), exist_ok=True)
-    log("add: loading %r into %s" % (url[:100], directory))
+
+    if is_torrent_url:
+        # Fetch + verify here so a login page / 404 / wrong link returns a clear
+        # NOT_A_TORRENT, and hand rtorrent the bytes directly (load.raw_start) so
+        # it never re-fetches and can't swallow non-torrent data silently.
+        raw = fetch_torrent(url)
+        log("add: loading %d-byte .torrent from %r into %s"
+            % (len(raw), url[:100], directory))
+        result = scgi_call(
+            "load.raw_start",
+            ("", Binary(raw), f'd.directory.set="{directory}"'),
+        )
+        log("add: rtorrent load.raw_start returned %r" % (result,))
+        return
+
+    # Magnet: no metafile to fetch (the info-hash is inline), so hand it straight
+    # to load.start. It still has to pull metadata from peers before it shows up
+    # in /status, so "added" is not the same as "downloading".
+    log("add: loading magnet %r into %s" % (url[:100], directory))
     result = scgi_call(
         "load.start",
         ("", url, f'd.directory.set="{directory}"'),
     )
-    # load.start returns 0 when rtorrent accepted the request. The torrent then
-    # has to fetch metadata (magnets) before it shows up in /status, so "added"
-    # is not the same as "downloading" — this line tells the two apart.
     log("add: rtorrent load.start returned %r" % (result,))
 
 
