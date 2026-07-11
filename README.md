@@ -38,7 +38,7 @@ Real [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https:
 | **`bridge.py`** | bundled in `install.sh` → `~/gctorrent/bridge.py` | The HTTP + JSON API on `127.0.0.1:5001`. Stdlib-only. |
 | **`work.sh`** | bundled in `install.sh` → `~/gctorrent/work.sh` | Boots bridge + location keep-alive + rtorrent on every iSH launch. |
 | **`howto_downloads.gif`** | this repo → served at `/help/howto_downloads.gif` | Short clip showing how to find the downloads folder in Files. |
-| **"Torrent Saver" Shortcut** | device-side | The UI: add from share sheet / clipboard, manage torrents, setup menu. |
+| **`Torrent_Saver.shortcut`** | this repo (also on device) | The UI Shortcut: add from share sheet / clipboard, manage torrents, setup menu. Download and import it (see below). |
 | **`dashboard.js`** | device-side ([Scriptable](https://scriptable.app)) | A live, polling status dashboard (WebView). |
 
 ## Requirements
@@ -60,6 +60,10 @@ cd /root && apk update && apk add ca-certificates wget && \
 `install.sh` extracts the scripts to `~/gctorrent/`, installs the packages, and starts everything (it `exec`s `work.sh` at the end). On later launches the `.profile` autostart hook starts the stack automatically — nothing to type. Grant the **Location → Always** prompt on first run.
 
 > **Flaky iSH networking?** apk fetches can drop ("DNS lookup error" / "network error"). The installer retries transient failures automatically; if it still fails, toggle Airplane mode or set a resolver (`echo "nameserver 1.1.1.1" > /etc/resolv.conf`) and re-run.
+
+### Get the Shortcut
+
+Download **[`Torrent_Saver.shortcut`](Torrent_Saver.shortcut)** from this repo and open it to import into the Shortcuts app. Importing a file directly needs **Settings → Shortcuts → Allow Untrusted Shortcuts** enabled. (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.)
 
 ## Using it — the "Torrent Saver" Shortcut
 
@@ -140,13 +144,15 @@ Base URL `http://127.0.0.1:5001`. All responses are JSON; errors are `{"ok": fal
 ## Repository layout
 
 ```
-install.sh            self-extracting installer (bundles bridge.py + work.sh)
-howto_downloads.gif   help clip served at /help/howto_downloads.gif
-README.md             this file
+install.sh              self-extracting installer (bundles bridge.py + work.sh)
+Torrent_Saver.shortcut  the iOS Shortcut (import into the Shortcuts app)
+howto_downloads.gif     help clip served at /help/howto_downloads.gif
+README.md               this file
+LICENSE                 MIT
 ```
 
-The iOS Shortcut and the Scriptable `dashboard.js` live on the device.
+The Scriptable `dashboard.js` lives on the device.
 
 ## License
 
-TBD.
+[MIT](LICENSE).
