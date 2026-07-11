@@ -1,5 +1,7 @@
 # claude-apple-gcTorrent
 
+https://www.icloud.com/shortcuts/7acd2a94bf87412da9d5a707f6d7e3d4
+
 **A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app — driven by an iOS Shortcut.**
 
 The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a clean HTTP + JSON API on loopback, and the native **Shortcuts** app is the UI: add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`.
