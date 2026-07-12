@@ -597,15 +597,24 @@ def do_resume(h):
     # stayed open, so no hash re-check). But d.start only queues a "started"
     # announce for the next *scheduled* slot, so a resumed torrent can sit with no
     # peers for minutes — which is exactly why fully restarting rtorrent (a fresh
-    # announce) "un-sticks" it. Force an immediate tracker re-announce here so
-    # resume re-fetches peers now instead of waiting. Non-fatal: a torrent with no
-    # usable tracker (pure magnet / DHT-only) just no-ops or errors harmlessly.
-    log("resume (start): %s" % h)
-    scgi_call("d.start", (h,))
+    # announce) "un-sticks" it.
+    #
+    # We automate the "restart rtorrent" dance here: start the torrent, save the
+    # session so the "started" state persists, then kill rtorrent. work.sh will
+    # immediately respawn it, giving it the fresh start it needs to find peers.
+    log("resume (start + restart): %s" % h)
     try:
-        scgi_call("d.tracker_announce", (h,))
+        scgi_call("d.start", (h,))
+        scgi_call("session.save")
     except RuntimeError as e:
-        log("resume: tracker_announce failed (non-fatal): %s" % e)
+        log("resume: d.start/session.save failed: %s" % e)
+        raise
+
+    # Kill rtorrent. work.sh handles the auto-restart loop.
+    try:
+        subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
+    except Exception as e:
+        log("resume: pkill failed: %s" % e)
 
 
 def as_bool(v):
@@ -918,8 +927,15 @@ while [ ! -f "$READY_FLAG" ] && [ "$i" -lt 15 ]; do
     i=$((i + 1))
 done
 
-echo "Starting rtorrent..."
-rtorrent
+# Start rtorrent in a loop so bridge.py can trigger a restart by killing it.
+# To stop for real, use the "Detach" feature (which sets $DETACH_FLAG).
+while [ ! -f "$DETACH_FLAG" ]; do
+    echo "Starting rtorrent..."
+    rtorrent
+    [ -f "$DETACH_FLAG" ] && break
+    echo "rtorrent exited (crash or resumed-restart). Respawning in 1s..."
+    sleep 1
+done
 
 # rtorrent exited (crash or Ctrl-Q). Leave the bridge running so the Shortcut can
 # still reach it; work.sh reuses it (the pgrep guard above) on the next launch.
