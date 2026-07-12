@@ -997,7 +997,12 @@ wget -qO /root/gctorrent/howto_downloads.gif \
   || echo "  (help clip download skipped)"
 
 echo "[2/4] directories + .rtorrent.rc..."
-mkdir -p /root/downloads /root/.session
+# Only the session dir is needed up front (rtorrent reads it at startup). The
+# downloads folder is NOT pre-created: the bridge makes the destination folder on
+# the first add (the name the user picks, or "downloads" as the fallback when the
+# folder is left blank), so a fresh install doesn't leave an empty ~/downloads
+# sitting around before anything has actually been downloaded.
+mkdir -p /root/.session
 cat > /root/.rtorrent.rc << 'RCEOF'
 network.scgi.open_port = 127.0.0.1:5000
 directory.default.set = /root/downloads
