@@ -312,28 +312,37 @@ def fetch_torrent(url):
     return data
 
 
-# Base for a bare/relative destination — matches directory.default.set in
-# ~/.rtorrent.rc, so a subfolder name lands under the same downloads root.
-DOWNLOAD_ROOT = "/root/downloads"
+# Where the Shortcut's paths are rooted. Its prompt is "Save to folder (related
+# to iSH/root/)", so the folder the user types is relative to HOME (/root) and
+# already includes "downloads" when they want it there. Anchoring a relative path
+# under /root/downloads instead would double it -> /root/downloads/downloads/...
+HOME_DIR = "/root"
+# Fallback when the folder is left blank: the conventional downloads directory,
+# which is also rtorrent's directory.default.set.
+DEFAULT_DIR = "/root/downloads"
 
 
 def resolve_directory(directory):
     """Normalise the Shortcut's destination into ONE absolute path, used both to
     create the folder and to tell rtorrent where to save — so the two can never
-    resolve to different places. A bare/relative subfolder is anchored under
-    DOWNLOAD_ROOT (a relative d.directory would otherwise override
-    directory.default and land outside downloads), and ~ is expanded.
+    resolve to different places. The Shortcut asks for a folder "related to
+    iSH/root/", i.e. relative to HOME, so a bare/relative path is anchored under
+    /root (NOT under /root/downloads — the typed path already carries its own
+    "downloads" prefix); ~ is expanded; a blank path falls back to the default
+    downloads dir.
 
-    This matters across restarts: rtorrent stores d.directory in its session file
-    verbatim and, on the next launch, resolves a relative or ~ path against its
-    own current working directory — which iSH does not pin (work.sh starts
-    rtorrent with no cd). If that resolves anywhere other than where the data was
-    actually written, the recheck finds no chunks and the torrent comes back as
-    "Download registered as completed, but hash check returned unfinished
-    chunks." An absolute path removes the ambiguity."""
+    Anchoring to an absolute path also matters across restarts: rtorrent stores
+    d.directory in its session file verbatim and, on the next launch, resolves a
+    relative or ~ path against its own current working directory — which iSH does
+    not pin (work.sh starts rtorrent with no cd). If that resolves anywhere other
+    than where the data was actually written, the recheck finds no chunks and the
+    torrent comes back as "Download registered as completed, but hash check
+    returned unfinished chunks." An absolute path removes the ambiguity."""
     d = os.path.expanduser((directory or "").strip())
+    if not d:
+        return DEFAULT_DIR
     if not os.path.isabs(d):
-        d = os.path.join(DOWNLOAD_ROOT, d)
+        d = os.path.join(HOME_DIR, d)
     return os.path.normpath(d)
 
 
