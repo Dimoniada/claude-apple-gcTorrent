@@ -46,8 +46,8 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /add     {"data":<base64>, "directory":...} -> {"ok": true}
       data is base64 of EITHER a magnet/HTTP link OR a .torrent file; the bridge
       auto-detects which, so the Shortcut can always base64 its input.
-    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.stop)
-    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.start)
+    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.pause)
+    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.resume)
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /settings {"lastPath":...} and/or {"pollMs":...} -> {"ok": true}
     POST /detach                                -> {"ok": true}
@@ -564,17 +564,32 @@ def do_attach():
 
 
 def do_pause(h):
-    # d.stop, not d.pause: a hard stop persists across rtorrent restarts and sets
-    # d.state=0 immediately, so get_status reports PAUSED reliably and at once.
-    # d.pause is a soft, non-persistent throttle that get_status couldn't detect.
-    log("pause (stop): %s" % h)
-    scgi_call("d.stop", (h,))
+    # Soft pause (d.pause), not a hard stop (d.stop). d.pause sets d.is_active=0
+    # while leaving the torrent open and started, so:
+    #   * get_status still reports PAUSED — it checks is_active (the older comment
+    #     claiming d.pause is undetectable was stale);
+    #   * resume is instant — rtorrent keeps its peer/tracker connections warm
+    #     instead of tearing them down and having to re-announce on d.start; and
+    #   * no hash re-check risk on resume, since the download is never closed.
+    # The trade-off is that a soft pause isn't persisted in the session, so a
+    # paused torrent auto-resumes if rtorrent is restarted (e.g. iSH relaunch).
+    log("pause: %s" % h)
+    scgi_call("d.pause", (h,))
+    # Checkpoint the session now that this torrent is quiescent: if the app is
+    # killed while paused, its file isn't being written, so the saved fast-resume
+    # data still matches on disk and rtorrent skips the hash check on next launch.
+    # Non-fatal — a failed checkpoint must not fail the pause itself.
+    try:
+        scgi_call("session.save")
+    except RuntimeError as e:
+        log("pause: session.save failed (non-fatal): %s" % e)
 
 
 def do_resume(h):
-    # Mirror of do_pause: restart the stopped torrent from where it left off.
-    log("resume (start): %s" % h)
-    scgi_call("d.start", (h,))
+    # Mirror of do_pause: d.resume clears the soft pause and the torrent picks up
+    # from where it left off, reusing the connections d.pause kept alive.
+    log("resume: %s" % h)
+    scgi_call("d.resume", (h,))
 
 
 def as_bool(v):
@@ -955,6 +970,13 @@ cat > /root/.rtorrent.rc << 'RCEOF'
 network.scgi.open_port = 127.0.0.1:5000
 directory.default.set = /root/downloads
 session.path.set = /root/.session
+# Periodically flush session state (piece bitfield + file mtimes) to the session
+# dir so rtorrent can fast-resume instead of re-hashing every torrent on the next
+# launch. iSH can't guarantee a clean shutdown — iOS usually SIGKILLs the app, so
+# there's no chance to save on exit — and a bare rtorrent doesn't schedule this on
+# its own. A 5-minute checkpoint keeps an unclean kill from costing a full
+# re-check. (First run at 300s, then every 300s.)
+schedule2 = session_save, 300, 300, ((session.save))
 # Raise the XML-RPC request cap from the 512 KiB default so larger .torrent
 # files fit. The bridge sends the file as base64 inside the XML-RPC body
 # (load.raw_start), which inflates ~500 KB to ~690 KB and hit "Fault -503:
