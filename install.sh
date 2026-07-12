@@ -593,11 +593,19 @@ def do_pause(h):
 
 
 def do_resume(h):
-    # Mirror of do_pause: d.start restarts the stopped torrent from where it left
-    # off. The download stayed open (d.stop doesn't close it), so this doesn't
-    # trigger a hash re-check; it just re-announces to find peers again.
+    # d.start restarts the stopped torrent from where it left off (the download
+    # stayed open, so no hash re-check). But d.start only queues a "started"
+    # announce for the next *scheduled* slot, so a resumed torrent can sit with no
+    # peers for minutes — which is exactly why fully restarting rtorrent (a fresh
+    # announce) "un-sticks" it. Force an immediate tracker re-announce here so
+    # resume re-fetches peers now instead of waiting. Non-fatal: a torrent with no
+    # usable tracker (pure magnet / DHT-only) just no-ops or errors harmlessly.
     log("resume (start): %s" % h)
     scgi_call("d.start", (h,))
+    try:
+        scgi_call("d.tracker_announce", (h,))
+    except RuntimeError as e:
+        log("resume: tracker_announce failed (non-fatal): %s" % e)
 
 
 def as_bool(v):
