@@ -46,8 +46,8 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /add     {"data":<base64>, "directory":...} -> {"ok": true}
       data is base64 of EITHER a magnet/HTTP link OR a .torrent file; the bridge
       auto-detects which, so the Shortcut can always base64 its input.
-    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.pause)
-    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.resume)
+    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.stop)
+    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.start)
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /settings {"lastPath":...} and/or {"pollMs":...} -> {"ok": true}
     POST /detach                                -> {"ok": true}
@@ -564,21 +564,19 @@ def do_attach():
 
 
 def do_pause(h):
-    # Soft pause (d.pause), not a hard stop (d.stop). d.pause sets d.is_active=0
-    # while leaving the torrent open and started, so:
-    #   * get_status still reports PAUSED — it checks is_active (the older comment
-    #     claiming d.pause is undetectable was stale);
-    #   * resume is instant — rtorrent keeps its peer/tracker connections warm
-    #     instead of tearing them down and having to re-announce on d.start; and
-    #   * no hash re-check risk on resume, since the download is never closed.
-    # The trade-off is that a soft pause isn't persisted in the session, so a
-    # paused torrent auto-resumes if rtorrent is restarted (e.g. iSH relaunch).
-    log("pause: %s" % h)
-    scgi_call("d.pause", (h,))
-    # Checkpoint the session now that this torrent is quiescent: if the app is
-    # killed while paused, its file isn't being written, so the saved fast-resume
-    # data still matches on disk and rtorrent skips the hash check on next launch.
-    # Non-fatal — a failed checkpoint must not fail the pause itself.
+    # Hard stop (d.stop), not a soft pause (d.pause). d.stop sets d.state=0, which
+    # IS saved in the session — so a paused torrent stays paused across an rtorrent
+    # restart (iSH relaunch). A soft d.pause is only a runtime flag, so the torrent
+    # would silently auto-resume on the next launch, which isn't what "pause"
+    # should mean. get_status reports PAUSED from state/is_active either way.
+    # (The resume problems that once argued for soft pause turned out to be the
+    # restart re-hash and the no-peers/dead-tracker stall — not d.stop/d.start.)
+    log("pause (stop): %s" % h)
+    scgi_call("d.stop", (h,))
+    # Checkpoint the session now that this torrent is quiescent: it's stopped and
+    # not being written, so the saved fast-resume data still matches on disk and
+    # rtorrent skips the hash check on the next launch. Non-fatal — a failed
+    # checkpoint must not fail the pause itself.
     try:
         scgi_call("session.save")
     except RuntimeError as e:
@@ -586,10 +584,11 @@ def do_pause(h):
 
 
 def do_resume(h):
-    # Mirror of do_pause: d.resume clears the soft pause and the torrent picks up
-    # from where it left off, reusing the connections d.pause kept alive.
-    log("resume: %s" % h)
-    scgi_call("d.resume", (h,))
+    # Mirror of do_pause: d.start restarts the stopped torrent from where it left
+    # off. The download stayed open (d.stop doesn't close it), so this doesn't
+    # trigger a hash re-check; it just re-announces to find peers again.
+    log("resume (start): %s" % h)
+    scgi_call("d.start", (h,))
 
 
 def as_bool(v):
@@ -970,6 +969,20 @@ cat > /root/.rtorrent.rc << 'RCEOF'
 network.scgi.open_port = 127.0.0.1:5000
 directory.default.set = /root/downloads
 session.path.set = /root/.session
+# Peer discovery beyond trackers. Many torrents here ride on flaky public
+# trackers, and iSH often can't even reach UDP ones — so without DHT/PEX a
+# torrent whose tracker is down finds no peers and stalls at a fixed percent.
+# DHT (auto: enabled for public torrents, off for private) plus peer exchange
+# let it find peers independently of the tracker; the dht_node schedule bootstraps
+# the DHT so it can join the swarm even when the torrent's own tracker is dead.
+# Random high ports (not the classic, DPI-throttled 6881-6889 range); inbound is
+# moot behind carrier NAT anyway. Note: this joins the device to the public DHT
+# swarm (slightly more network/battery, less private than tracker-only).
+dht.mode.set = auto
+protocol.pex.set = yes
+network.port_range.set = 6890-9999
+network.port_random.set = yes
+schedule2 = dht_node, 5, 0, "dht.add_node=dht.transmissionbt.com:6881"
 # Periodically flush session state (piece bitfield + file mtimes) to the session
 # dir so rtorrent can fast-resume instead of re-hashing every torrent on the next
 # launch. iSH can't guarantee a clean shutdown — iOS usually SIGKILLs the app, so
