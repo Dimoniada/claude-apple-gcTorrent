@@ -46,8 +46,8 @@ Endpoints (all responses are JSON; errors are {"ok": false, "error": "<CODE>"}):
     POST /add     {"data":<base64>, "directory":...} -> {"ok": true}
       data is base64 of EITHER a magnet/HTTP link OR a .torrent file; the bridge
       auto-detects which, so the Shortcut can always base64 its input.
-    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.stop)
-    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.start)
+    POST /pause   {"hash":...}                  -> {"ok": true}   (rtorrent d.pause)
+    POST /resume  {"hash":...}                  -> {"ok": true}   (rtorrent d.resume)
     POST /remove  {"hash":..., "deleteFile":bool} -> {"ok": true}
     POST /settings {"lastPath":...} and/or {"pollMs":...} -> {"ok": true}
     POST /detach                                -> {"ok": true}
@@ -72,6 +72,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -311,12 +312,149 @@ def fetch_torrent(url):
     return data
 
 
+# Base for a bare/relative destination — matches directory.default.set in
+# ~/.rtorrent.rc, so a subfolder name lands under the same downloads root.
+DOWNLOAD_ROOT = "/root/downloads"
+
+
+def resolve_directory(directory):
+    """Normalise the Shortcut's destination into ONE absolute path, used both to
+    create the folder and to tell rtorrent where to save — so the two can never
+    resolve to different places. A bare/relative subfolder is anchored under
+    DOWNLOAD_ROOT (a relative d.directory would otherwise override
+    directory.default and land outside downloads), and ~ is expanded.
+
+    This matters across restarts: rtorrent stores d.directory in its session file
+    verbatim and, on the next launch, resolves a relative or ~ path against its
+    own current working directory — which iSH does not pin (work.sh starts
+    rtorrent with no cd). If that resolves anywhere other than where the data was
+    actually written, the recheck finds no chunks and the torrent comes back as
+    "Download registered as completed, but hash check returned unfinished
+    chunks." An absolute path removes the ambiguity."""
+    d = os.path.expanduser((directory or "").strip())
+    if not os.path.isabs(d):
+        d = os.path.join(DOWNLOAD_ROOT, d)
+    return os.path.normpath(d)
+
+
+# --- magnet directory reconciliation (rtorrent bug rakshasa/rtorrent#376) -----
+#
+# A magnet loaded with d.directory.set keeps that directory only on its temporary
+# <hash>.meta download. Once the metadata resolves, rtorrent reloads the torrent
+# from the fetched .torrent and drops d.directory back to directory.default — so
+# the folder the user picked is created but stays empty while the data lands in
+# /root/downloads. (.torrent-file adds don't hit this; their directory sticks.)
+#
+# We remember each magnet's intended directory by info-hash and a background
+# thread re-applies it (stop -> d.directory.set -> start) the moment the magnet
+# resolves. In-memory only: a bridge restart mid-resolution forgets the intent
+# (rare — the user can re-add).
+RECONCILE_INTERVAL = 2      # seconds between reconcile passes
+RECONCILE_MAX_TRIES = 5     # stop re-trying a stubborn one after this many passes
+_pending_lock = threading.Lock()
+_pending_magnets = {}       # info-hash (40-hex upper) -> {"dir": <abs>, "tries": int}
+
+
+def magnet_infohash(url):
+    """The BitTorrent info-hash from a magnet's xt=urn:btih:<hash>, as uppercase
+    40-char hex (rtorrent's d.hash form), or None if absent/unparseable. Accepts
+    both the 40-char hex and 32-char base32 encodings."""
+    for xt in parse_qs(urlparse(url).query).get("xt", []):
+        prefix = "urn:btih:"
+        if not xt.startswith(prefix):
+            continue
+        h = xt[len(prefix):].strip()
+        if len(h) == 40:
+            try:
+                int(h, 16)
+                return h.upper()
+            except ValueError:
+                return None
+        if len(h) == 32:
+            try:
+                return base64.b32decode(h.upper()).hex().upper()
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def track_magnet(url, directory):
+    """Remember a just-added magnet's intended (already absolute) directory so the
+    reconciler can restore it after rtorrent reverts it on metadata resolution."""
+    ih = magnet_infohash(url)
+    if not ih:
+        return
+    with _pending_lock:
+        _pending_magnets[ih] = {"dir": directory, "tries": 0}
+    log("add: tracking magnet %s -> %s for directory reconcile" % (ih, directory))
+
+
+def reconcile_pending_magnets():
+    """One reconcile pass: for each tracked magnet, once rtorrent has resolved the
+    metadata re-apply the user's directory if rtorrent reverted it, then stop
+    tracking it. Best-effort — rtorrent being down/busy is ignored and retried
+    next pass.
+
+    "Resolved" is detected by name, not size: while a magnet is still fetching its
+    metadata rtorrent lists it as the placeholder "<HASH>.meta" (and reports a
+    dummy d.size_bytes of 1, so size is no signal). The directory revert we're
+    fixing only happens when that placeholder is replaced by the real torrent, so
+    we must keep tracking until the ".meta" name is gone."""
+    with _pending_lock:
+        pending = list(_pending_magnets.items())  # inner dicts are shared refs
+    if not pending:
+        return
+    try:
+        rows = scgi_call("d.multicall2",
+                         ("", "main", "d.hash=", "d.name=", "d.directory="))
+    except RuntimeError:
+        return  # rtorrent down/busy — try again next pass
+    current = {r[0].upper(): (r[1], r[2]) for r in (rows or [])}
+    done = []
+    for ih, info in pending:
+        if ih not in current:
+            done.append(ih)                       # removed before it resolved
+            continue
+        name, cur_dir = current[ih]
+        if name.lower().endswith(".meta"):
+            continue                              # metadata not resolved yet
+        want = info["dir"]
+        if os.path.normpath(cur_dir) == os.path.normpath(want):
+            done.append(ih)                       # already correct — nothing to do
+            continue
+        try:
+            scgi_call("d.stop", (ih,))
+            scgi_call("d.directory.set", (ih, want))
+            scgi_call("d.start", (ih,))
+            log("reconcile: moved magnet %s to %s (was %s)" % (ih, want, cur_dir))
+            done.append(ih)
+        except RuntimeError:
+            info["tries"] += 1                    # mutates the shared registry dict
+            if info["tries"] >= RECONCILE_MAX_TRIES:
+                log("reconcile: giving up on magnet %s after %d tries"
+                    % (ih, info["tries"]))
+                done.append(ih)
+    with _pending_lock:
+        for ih in done:
+            _pending_magnets.pop(ih, None)
+
+
+def reconcile_loop():
+    while True:
+        time.sleep(RECONCILE_INTERVAL)
+        try:
+            reconcile_pending_magnets()
+        except Exception as e:  # noqa: BLE001 - never let the reconciler thread die
+            log("reconcile loop error: %s" % e)
+
+
 def do_add(url, directory):
     """Validate + load a magnet/.torrent link into rtorrent. Raises
     RuntimeError("INVALID_LINK") (not a magnet/http link),
     RuntimeError("NOT_A_TORRENT") (http link that isn't a .torrent) or
     RuntimeError("DAEMON_UNREACHABLE")."""
     url = (url or "").strip()
+    directory = resolve_directory(directory)
     is_magnet = url.startswith("magnet:")
     is_torrent_url = url.startswith("http://") or url.startswith("https://")
     if not (is_magnet or is_torrent_url):
@@ -348,6 +486,9 @@ def do_add(url, directory):
         ("", url, f'd.directory.set="{directory}"'),
     )
     log("add: rtorrent load.start returned %r" % (result,))
+    # rtorrent drops d.directory when the magnet's metadata resolves (bug #376),
+    # so remember the intended folder for the reconciler to restore.
+    track_magnet(url, directory)
 
 
 def do_add_raw(data_b64, directory):
@@ -357,6 +498,7 @@ def do_add_raw(data_b64, directory):
     with no magnet-vs-file branch of its own. Non-base64 chars (e.g. line breaks
     Shortcuts may add) are dropped by b64decode's default mode. Raises
     RuntimeError("INVALID_LINK") if it's neither a link nor a bencoded .torrent."""
+    directory = resolve_directory(directory)
     try:
         raw = base64.b64decode(data_b64 or "")
     except (ValueError, TypeError):
@@ -422,17 +564,32 @@ def do_attach():
 
 
 def do_pause(h):
-    # d.stop, not d.pause: a hard stop persists across rtorrent restarts and sets
-    # d.state=0 immediately, so get_status reports PAUSED reliably and at once.
-    # d.pause is a soft, non-persistent throttle that get_status couldn't detect.
-    log("pause (stop): %s" % h)
-    scgi_call("d.stop", (h,))
+    # Soft pause (d.pause), not a hard stop (d.stop). d.pause sets d.is_active=0
+    # while leaving the torrent open and started, so:
+    #   * get_status still reports PAUSED — it checks is_active (the older comment
+    #     claiming d.pause is undetectable was stale);
+    #   * resume is instant — rtorrent keeps its peer/tracker connections warm
+    #     instead of tearing them down and having to re-announce on d.start; and
+    #   * no hash re-check risk on resume, since the download is never closed.
+    # The trade-off is that a soft pause isn't persisted in the session, so a
+    # paused torrent auto-resumes if rtorrent is restarted (e.g. iSH relaunch).
+    log("pause: %s" % h)
+    scgi_call("d.pause", (h,))
+    # Checkpoint the session now that this torrent is quiescent: if the app is
+    # killed while paused, its file isn't being written, so the saved fast-resume
+    # data still matches on disk and rtorrent skips the hash check on next launch.
+    # Non-fatal — a failed checkpoint must not fail the pause itself.
+    try:
+        scgi_call("session.save")
+    except RuntimeError as e:
+        log("pause: session.save failed (non-fatal): %s" % e)
 
 
 def do_resume(h):
-    # Mirror of do_pause: restart the stopped torrent from where it left off.
-    log("resume (start): %s" % h)
-    scgi_call("d.start", (h,))
+    # Mirror of do_pause: d.resume clears the soft pause and the torrent picks up
+    # from where it left off, reusing the connections d.pause kept alive.
+    log("resume: %s" % h)
+    scgi_call("d.resume", (h,))
 
 
 def as_bool(v):
@@ -654,6 +811,10 @@ if __name__ == "__main__":
     atexit.register(
         lambda: os.path.exists(READY_FLAG) and os.remove(READY_FLAG)
     )
+    # Background thread that restores a magnet's chosen directory after rtorrent
+    # reverts it on metadata resolution (bug #376). Daemon so it dies with us.
+    threading.Thread(target=reconcile_loop, daemon=True).start()
+    log("magnet directory reconciler started")
     log(f"bridge.py listening on {RTORRENT_HOST}:{BRIDGE_PORT}")
     server.serve_forever()
 __GCTORRENT_BRIDGE_PY__
@@ -809,6 +970,13 @@ cat > /root/.rtorrent.rc << 'RCEOF'
 network.scgi.open_port = 127.0.0.1:5000
 directory.default.set = /root/downloads
 session.path.set = /root/.session
+# Periodically flush session state (piece bitfield + file mtimes) to the session
+# dir so rtorrent can fast-resume instead of re-hashing every torrent on the next
+# launch. iSH can't guarantee a clean shutdown — iOS usually SIGKILLs the app, so
+# there's no chance to save on exit — and a bare rtorrent doesn't schedule this on
+# its own. A 5-minute checkpoint keeps an unclean kill from costing a full
+# re-check. (First run at 300s, then every 300s.)
+schedule2 = session_save, 300, 300, ((session.save))
 # Raise the XML-RPC request cap from the 512 KiB default so larger .torrent
 # files fit. The bridge sends the file as base64 inside the XML-RPC body
 # (load.raw_start), which inflates ~500 KB to ~690 KB and hit "Fault -503:
