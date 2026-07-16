@@ -23,7 +23,7 @@ The bridge is **asynchronous and command-driven**: control actions enqueue a com
 │   Saver"    │                          ▼
 └─────────────┘                    ┌──────────┐   SCGI / XML-RPC   ┌──────────┐
 ┌─────────────┐  fetch()  ────────▶│bridge.py │ ─────────────────▶│ rtorrent │
-│  PWA in the │ ──────────────────▶│  (HTTP)  │  (127.0.0.1:5000)  │          │
+│  PWA in the │ ──────────────────▶│  (HTTP)  │     (AF_UNIX)      │          │
 │  Default    │   (127.0.0.1:5001) └──────────┘                    └──────────┘
 │  Browser    │                             └──── all inside iSH (Alpine) ────┘
 └─────────────┘
