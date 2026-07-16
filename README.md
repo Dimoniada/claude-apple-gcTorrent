@@ -2,7 +2,7 @@
 
 **A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app. An iOS Shortcut installs and launches it; an installable PWA is the UI.**
 
-The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a clean HTTP + JSON API on loopback. The UI is an installable **PWA** (served by the bridge itself at `/app`): add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`. The native **Shortcuts** app is a thin **launcher / installer** — it installs the backend, and its everyday action just opens iSH and then the PWA.
+The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a file AF_UNIX socket + JSON API on loopback. The UI is an installable **PWA** (served by the bridge itself at `/app`): add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`. The native **Shortcuts** app is a thin **launcher / installer** — it installs the backend, and its everyday action just opens iSH and then the PWA.
 
 The bridge is **asynchronous and command-driven**: control actions enqueue a command and return instantly, and a single background worker applies them to rtorrent (retrying while the daemon is busy) so the UI never blocks on a slow or pinned daemon.
 
