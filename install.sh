@@ -1298,7 +1298,10 @@ while [ ! -f "$DETACH_FLAG" ] && [ "$attempt" -lt 3 ]; do
 done
 
 if [ "$attempt" -ge 3 ] && [ ! -f "$DETACH_FLAG" ]; then
-    echo "rtorrent failed to stay up after 3 attempts — giving up."
+    echo "rtorrent failed to stay up after 3 attempts — giving up on restarts."
+    echo "Bridge + location keep-alive stay running; reopen iSH to retry rtorrent."
+    trap - EXIT
+    exit 0
 fi
 
 # rtorrent exited (crash or Ctrl-Q). Leave the bridge running so the Shortcut can
