@@ -792,6 +792,8 @@ def cancel_command(cmd_id):
     with _cmd_lock:
         for c in _commands:
             if c["id"] == cmd_id:
+                if c["state"] == "running":
+                    return False
                 _commands.remove(c)
                 _persist_queue()
                 log("command cancelled: %s (%s)" % (cmd_id, c["action"]))
@@ -1290,6 +1292,13 @@ while [ ! -f "$DETACH_FLAG" ] && [ "$attempt" -lt 3 ]; do
     attempt=$((attempt + 1))
     echo "Starting rtorrent... (attempt $attempt/3)"
     rtorrent
+    rc=$?
+    # Record the exit code + timestamp so a crash can be told apart from an iOS
+    # kill or a clean quit: rc=0 clean (^Q/quit), rc=137 (128+9 SIGKILL) iOS
+    # suspended/killed the backgrounded iSH, other non-zero (e.g. 139 SIGSEGV) a
+    # genuine rtorrent crash — then state/rtorrent.log has the details.
+    echo "$(date '+%Y-%m-%d %H:%M:%S') rtorrent exited rc=$rc (attempt $attempt/3)" \
+        >> /root/gctorrent/state/rtorrent-exits.log
     [ -f "$DETACH_FLAG" ] && break
     echo "restarting rtorrent in 5 sec (attempt $attempt of 3)"
     sleep 5
@@ -1757,7 +1766,7 @@ cat > /root/gctorrent/app.html << '__GCTORRENT_APP_HTML__'
     if(t){
       const done=fmtSize(t.bytesDone), total=fmtSize(t.sizeBytes);
       html+=irow("Name", t.name);
-      html+=irow("Hash", "#"+t.shortHash);
+      html+=irow("Short Hash", "#"+t.shortHash);
       html+=irow("State", t.status);
       html+=irow("Progress", t.percent+"%  ("+done+" / "+total+")");
       html+=irow("Download", t.downRate?fmtRate(t.downRate):"—");
@@ -2059,6 +2068,13 @@ schedule2 = session_save, 300, 300, ((session.save))
 # Raise the XML-RPC cap (512 KiB default) to fit base64'd multi-MB .torrent files.
 network.xmlrpc.size_limit.set = 8388608
 pieces.memory.max.set = 32M
+# --- diagnostics: write rtorrent's internal events to a file. Fixed name so it
+# overwrites each start instead of piling up timestamped logs. After a crash,
+# read it with: tail -n 100 /root/gctorrent/state/rtorrent.log
+log.open_file = "rtorrent", "/root/gctorrent/state/rtorrent.log"
+log.add_output = "info", "rtorrent"
+log.add_output = "warn", "rtorrent"
+log.add_output = "error", "rtorrent"
 RCEOF
 
 echo "[3/4] making work.sh executable..."
