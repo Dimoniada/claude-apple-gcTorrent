@@ -2,7 +2,9 @@
 
 **A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app — driven by an iOS Shortcut.**
 
-The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a clean HTTP + JSON API on loopback, and the native **Shortcuts** app is the UI: add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`.
+The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a clean HTTP + JSON API on loopback, and the native **Shortcuts** app is the UI: add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`. An installable **PWA** (served by the bridge itself at `/app`) is available too, for a full-screen app-like control surface without the Shortcut.
+
+The bridge is **asynchronous and command-driven**: control actions enqueue a command and return instantly, and a single background worker applies them to rtorrent (retrying while the daemon is busy) so the UI never blocks on a slow or pinned daemon.
 
 ---
 
@@ -35,8 +37,9 @@ The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https:/
 | Piece | Where | Role |
 |---|---|---|
 | **`install.sh`** | this repo | Self-extracting one-time installer. Bundles `bridge.py` + `work.sh` (as heredocs), installs `python3` + `rtorrent`, writes `~/.rtorrent.rc`, and adds a `.profile` autostart hook. |
-| **`bridge.py`** | bundled in `install.sh` → `~/gctorrent/bridge.py` | The HTTP + JSON API on `127.0.0.1:5001`. Stdlib-only. |
+| **`bridge.py`** | bundled in `install.sh` → `~/gctorrent/bridge.py` | The HTTP + JSON API on `127.0.0.1:5001`. Stdlib-only. Runs an async command queue + background worker, and serves the PWA. |
 | **`work.sh`** | bundled in `install.sh` → `~/gctorrent/work.sh` | Boots bridge + location keep-alive + rtorrent on every iSH launch. |
+| **`app.html`** | bundled in `install.sh` → `~/gctorrent/app.html`; served at `/app` | Standalone installable **PWA** ("Torrent Saver"). Same-origin with the bridge, so no CORS. Add to Home Screen for a full-screen app. |
 | **`howto_downloads.gif`** | this repo → served at `/help/howto_downloads.gif` | Short clip showing how to find the downloads folder in Files. |
 | **`Torrent_Saver.shortcut`** | this repo (also on device) | The UI Shortcut: add from share sheet / clipboard, manage torrents, setup menu. Download and import it (see below). |
 | **`dashboard.js`** | device-side ([Scriptable](https://scriptable.app)) | A live, polling status dashboard (WebView). |
@@ -78,6 +81,10 @@ The Shortcut is the front end; its first action sets `BaseURL` to `http://127.0.
 
 **📊 Dashboard** opens the Scriptable WebView, which polls `/status` and renders a live table (rate, %, status icon). Its refresh rate comes from `/settings` → `pollMs`.
 
+### The PWA app (optional)
+
+The bridge also serves a standalone **PWA** at `http://127.0.0.1:5001/app`. Open it in Safari or Orion, then **Share → Add to Home Screen** to install it as a full-screen app with its own icon and name ("Torrent Saver"). Because the page is served from the bridge's own origin, every `fetch()` is same-origin — no CORS and no host injection. The PWA polls `/status` for a live list and drives every action through the async `/command` queue, so a busy or briefly unreachable rtorrent shows a degraded banner and the pending-command chain instead of erroring out; queued commands can be dragged to the bin (`/command/cancel`) before they run.
+
 ### Where downloads go
 
 rtorrent downloads to iSH-local `/root/downloads`. With iSH Files integration on, that's visible in **Files → On My iPhone → iSH → root → downloads**. The **🎬 Find downloads** item (in Help and in each torrent's menu) shows a short clip on how to get there, fetched from the bridge at `/help/howto_downloads.gif` and shown with Quick Look.
@@ -97,13 +104,19 @@ Base URL `http://127.0.0.1:5001`. All responses are JSON; errors are `{"ok": fal
 | GET | `/status?short=<6hex>` | — | same, filtered to 0 or 1 torrent by short hash |
 | GET | `/settings` | — | `{"ok": true, "lastPath": "<str>", "pollMs": <int>}` |
 | GET | `/help/howto_downloads.gif` | — | `image/gif` |
+| GET | `/app` (also `/`) | — | `text/html` — the standalone "Torrent Saver" PWA page |
+| GET | `/manifest.json` | — | Web app manifest for the PWA install |
 | POST | `/add` | `{"url":…, "directory":…}` **or** `{"data":<base64>, "directory":…}` | `{"ok": true}` — `data` is base64 of a magnet/link **or** a `.torrent` file; the bridge auto-detects |
 | POST | `/pause` | `{"hash":…}` | `{"ok": true}` (rtorrent `d.stop`) |
 | POST | `/resume` | `{"hash":…}` | `{"ok": true}` (rtorrent `d.start`) |
 | POST | `/remove` | `{"hash":…, "deleteFile":bool}` | `{"ok": true}` |
 | POST | `/settings` | `{"lastPath":…}` and/or `{"pollMs":…}` | `{"ok": true}` (partial update) |
+| POST | `/command` | `{"action":…, "hash":…, "args":…, "id":…}` | `{"ok": true, "id": <str>}` — enqueue a command; the background worker applies it to rtorrent |
+| POST | `/command/cancel` | `{"id":…}` | `{"ok": bool, "id": <str>}` — pull a still-queued command out of the chain |
 | POST | `/detach` | — | `{"ok": true}` (enter maintenance mode) |
 | POST | `/attach` | — | `{"ok": true}` (leave maintenance mode) |
+
+`/status` also carries `"rtorrentState"` (`ONLINE` / `DAEMON_BUSY` / `DAEMON_UNREACHABLE` / `DETACHED`) and `"queue"` (the public view of pending commands), so the PWA can render the queued-command chain and a degraded banner even when rtorrent is temporarily unreachable.
 
 **Torrent object** (from `/status`):
 
@@ -139,12 +152,12 @@ Base URL `http://127.0.0.1:5001`. All responses are JSON; errors are `{"ok": fal
 
 ## Roadmap
 
-- **Asynchronous, command-driven bridge** — actions enqueue a command and return immediately (⏳ pending), applied to rtorrent by a background worker that retries on `DAEMON_BUSY`, with an interactive Scriptable dashboard (per-row buttons) as the primary control surface.
+- **Asynchronous, command-driven bridge** — ✅ implemented. Actions enqueue a command and return immediately (⏳ pending), applied to rtorrent by a background worker that retries on `DAEMON_BUSY`. The installable PWA (`/app`) is the interactive control surface with per-row buttons and drag-to-cancel of queued commands.
 
 ## Repository layout
 
 ```
-install.sh              self-extracting installer (bundles bridge.py + work.sh)
+install.sh              self-extracting installer (bundles bridge.py + work.sh + app.html PWA)
 Torrent_Saver.shortcut  the iOS Shortcut (import into the Shortcuts app)
 howto_downloads.gif     help clip served at /help/howto_downloads.gif
 README.md               this file
