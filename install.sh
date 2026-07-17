@@ -792,8 +792,6 @@ def cancel_command(cmd_id):
     with _cmd_lock:
         for c in _commands:
             if c["id"] == cmd_id:
-                if c["state"] == "running":
-                    return False
                 _commands.remove(c)
                 _persist_queue()
                 log("command cancelled: %s (%s)" % (cmd_id, c["action"]))
