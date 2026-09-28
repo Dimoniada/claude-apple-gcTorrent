@@ -66,7 +66,7 @@ cd /root && apk update && apk add ca-certificates wget && \
 
 ### Get the Shortcut
 
-Download **[`Torrent Saver.shortcut`](Torrent Saver.shortcut)** from this repo and open it to import into the Shortcuts app. Importing a file directly needs **Settings → Shortcuts → Allow Untrusted Shortcuts** enabled. (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.)
+Download **[`Torrent_Saver.shortcut`](Torrent_Saver.shortcut)** from this repo and open it to import into the Shortcuts app. Importing a file directly needs **Settings → Shortcuts → Allow Untrusted Shortcuts** enabled. (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.)
 
 ## Using it — the "Torrent Saver" Shortcut
 
