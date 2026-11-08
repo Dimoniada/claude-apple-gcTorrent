@@ -1647,6 +1647,14 @@ cat > "$APP/app.html" << '__GCTORRENT_APP_HTML__'
     color:var(--txt);}
   .popup button.danger{background:var(--red);}
   .popup img{max-width:100%; border-radius:8px; margin:6px 0;}
+  /* Help popup: no scrolling overlay, so cap the gif height and give it a
+     top-right close so the control stays on screen on a short phone (13 mini). */
+  #helpPop .popup{position:relative;}
+  #helpPop h3{padding:0 28px;}
+  #helpPop img{max-height:70vh; width:auto;}
+  .popup .x{position:absolute; top:8px; right:10px; width:30px; height:30px;
+    flex:none; padding:0; border-radius:8px; background:var(--panel);
+    border:1px solid var(--line); color:var(--txt); font-size:20px; line-height:1;}
   /* Info popup: a compact key/value table + optional red error at the top */
   .info{text-align:left; margin:0 0 8px;}
   .info .ierr{color:var(--red); font-weight:600; margin:0 0 10px;
@@ -1751,9 +1759,9 @@ cat > "$APP/app.html" << '__GCTORRENT_APP_HTML__'
 <!-- help gif popup -->
 <div class="overlay" id="helpPop" hidden>
   <div class="popup">
+    <button class="x" aria-label="Close" onclick="document.getElementById('helpPop').hidden=true">&times;</button>
     <h3>Where to find my downloads</h3>
     <img src="/help/howto_downloads.gif" alt="How to find your downloads">
-    <button onclick="document.getElementById('helpPop').hidden=true">OK</button>
   </div>
 </div>
 
