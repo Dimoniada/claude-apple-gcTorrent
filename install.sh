@@ -1647,12 +1647,15 @@ cat > "$APP/app.html" << '__GCTORRENT_APP_HTML__'
     color:var(--txt);}
   .popup button.danger{background:var(--red);}
   .popup img{max-width:100%; border-radius:8px; margin:6px 0;}
-  /* Help popup: no scrolling overlay, so cap the gif height and give it a
-     top-right close so the control stays on screen on a short phone (13 mini). */
-  #helpPop .popup{position:relative;}
+  /* Help popup: taller than a short phone's viewport (13 mini), and a centered
+     overlay clips its top, close included. Top-align + scroll this overlay;
+     margin:auto still centers the popup whenever it fits. */
+  #helpPop{align-items:flex-start; overflow-y:auto;}
+  #helpPop .popup{position:relative; margin:auto;}
   #helpPop h3{padding:0 28px;}
   #helpPop img{max-height:70vh; width:auto;}
-  .popup .x{position:absolute; top:8px; right:10px; width:30px; height:30px;
+  .popup .x{position:absolute; top:8px; right:10px; z-index:1; width:30px; height:30px;
+    display:flex; align-items:center; justify-content:center;
     flex:none; padding:0; border-radius:8px; background:var(--panel);
     border:1px solid var(--line); color:var(--txt); font-size:20px; line-height:1;}
   /* Info popup: a compact key/value table + optional red error at the top */
