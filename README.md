@@ -1,6 +1,6 @@
 # claude-apple-gcTorrent
 
-**A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app. An iOS Shortcut installs and launches it; an installable PWA is the UI.**
+**A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app. An iOS Shortcut installs and launches it; an installable PWA is the UI.** The same Shortcut and installer also run natively on a Mac (no iSH needed there).
 
 The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a file AF_UNIX socket + JSON API on loopback. The UI is an installable **PWA** (served by the bridge itself at `/app`): add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`. The native **Shortcuts** app is a thin **launcher / installer** — it installs the backend, and its everyday action just opens iSH and then the PWA.
 
@@ -49,6 +49,7 @@ The bridge is **asynchronous and command-driven**: control actions enqueue a com
 - iPhone / iPad with these free apps: **[iSH Shell](https://apps.apple.com/app/ish-shell/id1436902243)** and **[Shortcuts](https://apps.apple.com/app/shortcuts/id915249334)**.
 - **iSH → Settings → Location → Always.** rtorrent runs as iSH's foreground app; the location keep-alive is what lets it survive in the background. Without it, rtorrent only runs while iSH is open in the foreground.
 - **iSH → Settings → Files integration ON** if you want to reach the downloads folder from the Files app.
+- Mac: [Homebrew](https://brew.sh) and the Shortcuts app (built in). No iSH: the iOS version of iSH runs on Apple-silicon Macs, but its Files integration crashes there, and a Mac can run rtorrent natively anyway.
 
 ## Install
 
@@ -64,9 +65,34 @@ cd /root && apk update && apk add ca-certificates wget && \
 
 > **Flaky iSH networking?** apk fetches can drop ("DNS lookup error" / "network error" / "could not resolve host"). The installer retries transient failures automatically and appends a public DNS fallback (`8.8.8.8`) so lookups keep working even when the network — a PC/phone hotspot especially — hands iSH an unreachable resolver. If it still fails, toggle Airplane mode or set a resolver manually (`echo "nameserver 8.8.8.8" > /etc/resolv.conf`) and re-run.
 
+### Install on a Mac
+
+The same `install.sh` detects macOS. In **Terminal**, paste and run (the Shortcut's **2) Install backend** copies this for you and opens Terminal):
+
+```sh
+curl -fsSL -o /tmp/gctorrent-install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh /tmp/gctorrent-install.sh
+```
+
+On a Mac it:
+
+- installs `rtorrent` with Homebrew (and `python3` only if neither Homebrew's nor Apple's works);
+- puts the scripts in `~/gctorrent/`, with rtorrent's config in `~/gctorrent/config/rtorrent/rtorrent.rc`, so an existing `~/.rtorrent.rc` of yours is never touched;
+- installs a LaunchAgent, `~/Library/LaunchAgents/io.github.dimoniada.gctorrent.plist`, in place of iSH's `.profile` hook and Location trick. The backend starts at every login and launchd restarts it if it dies. macOS shows a "Background Items Added" notice the first time;
+- runs rtorrent headless (`system.daemon.set`), so there's no terminal UI, and opens `http://127.0.0.1:5001/app` when done.
+
+Homebrew ships rtorrent 0.16, which renamed a few settings compared with iSH's Alpine build. The Mac config uses the new names: `network.listen.port.*`, `schedule`, and log groups `errors`/`events`.
+
+To uninstall on a Mac:
+
+```sh
+launchctl bootout gui/$(id -u)/io.github.dimoniada.gctorrent; rm -f ~/Library/LaunchAgents/io.github.dimoniada.gctorrent.plist; rm -rf ~/gctorrent
+```
+
+(Your downloads in `~/Downloads` are kept.)
+
 ### Get the Shortcut
 
-Download **[`Torrent_Saver.shortcut`](Torrent_Saver.shortcut)** (https://routinehub.co/shortcut/26039/) from this repo and open it to import into the Shortcuts app. Importing a file directly needs **Settings → Shortcuts → Allow Untrusted Shortcuts** enabled. (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.)
+Download **[`Torrent_Saver.shortcut`](Torrent_Saver.shortcut)** (https://routinehub.co/shortcut/26039/) from this repo and open it to import into the Shortcuts app. Importing a file directly needs **Settings → Shortcuts → Allow Untrusted Shortcuts** enabled. (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.) It's one Shortcut for iPhone, iPad and Mac: it checks the device model and takes the Mac path when it contains "Mac", so the copy synced through iCloud works everywhere.
 
 ## Using it — the "Torrent Saver" Shortcut
 
@@ -80,6 +106,11 @@ The Shortcut is a thin **launcher / installer**, not the torrent UI — the actu
 - **🏴‍☠️ Torrent Saver** — the everyday entry point. It opens **iSH** (so the stack comes up), waits a moment, then opens the installable **PWA** (`BaseURL/app`) in your default browser — that's where you add magnets / `.torrent`s and manage torrents.
 - **🚼 Exit** — close the Shortcut.
 
+On a Mac there's no iSH step:
+
+- **⚙️ Set up / reinstall** shows a Mac menu: **⤵️ Install / update backend** (copies the Mac install command, shows how to paste it, and opens **Terminal**; no `/detach`, because the installer stops the old backend itself), **🛟 Help** and **⬅️ Return**.
+- **🏴‍☠️ Torrent Saver** opens the PWA straight away, because the LaunchAgent keeps the backend running.
+
 ### The PWA app — the UI
 
 The bridge serves a standalone **PWA** at `http://127.0.0.1:5001/app`; this is the control surface. The Shortcut's **🏴‍☠️ Torrent Saver** opens it for you, or you can open it directly in Safari or Orion and **Share → Add to Home Screen** to install it as a full-screen app with its own icon and name ("Torrent Saver"). Because the page is served from the bridge's own origin, every `fetch()` is same-origin — no CORS and no host injection. The PWA polls `/status` for a live list and drives every action (add, resume, pause, remove) through the async `/command` queue, so a busy or briefly unreachable rtorrent shows a degraded banner and the pending-command chain instead of erroring out; queued commands can be dragged to the bin (`/command/cancel`) before they run.
@@ -87,6 +118,8 @@ The bridge serves a standalone **PWA** at `http://127.0.0.1:5001/app`; this is t
 ### Where downloads go
 
 rtorrent downloads to iSH-local `/root/downloads`. With iSH Files integration on, that's visible in **Files → On My iPhone → iSH → root → downloads**. A short clip on how to get there is served by the bridge at `/help/howto_downloads.gif`.
+
+On a Mac, `~/Downloads` plays the role of `/root`: a blank folder saves to `~/Downloads`, and a typed folder `movies` becomes `~/Downloads/movies`.
 
 ### Maintenance mode (detach / attach)
 
@@ -140,14 +173,18 @@ Base URL `http://127.0.0.1:5001`. All responses are JSON; errors are `{"ok": fal
 | `DETACHED` | maintenance mode — rtorrent intentionally off, bridge still answers |
 | `NOT_A_TORRENT` | an http(s) link that didn't return a `.torrent` (login page / 404 / wrong link) |
 | `INVALID_LINK` | not a magnet, http(s) link, or bencoded `.torrent` |
-| `BAD_REQUEST` | missing/invalid parameters |
+| `BAD_REQUEST` | missing/invalid parameters (including a folder name with `"` or `\`) |
+| `FORBIDDEN` | a POST from another web page (its `Origin` isn't the bridge's own) |
 | `NOT_FOUND` | unknown endpoint |
 
 ## Security & trust model
 
 - The bridge binds **`127.0.0.1` only** — single-user device, nothing is reachable off-device.
-- **No auth token** today (loopback-only makes it unnecessary in practice).
+- **No auth token today.** Web pages in your browser can still send requests to `127.0.0.1`, so every POST carrying an `Origin` other than the bridge's own (`http://127.0.0.1:5001` / `http://localhost:5001`) is refused with `FORBIDDEN`. The Shortcuts app sends no `Origin`, so it keeps working. There is no CORS header, so other pages can't read `/status` either.
+- Folder names with `"` or `\` are refused: the folder goes inside an rtorrent command string, and a quote would let the rest run as extra rtorrent commands.
+- `sh tests/security_check.sh` checks both against a running bridge (needs `curl`, e.g. on a Mac).
 - Torrent names/messages are HTML-escaped in the PWA.
+- On a Mac `127.0.0.1` is shared by every local account, so another user logged in to the same Mac could reach the bridge. rtorrent's SCGI socket, which can run commands, stays private (`~/gctorrent/state` is `chmod 700`, without iSH's `0777`).
 
 ## Roadmap
 
@@ -157,7 +194,7 @@ Base URL `http://127.0.0.1:5001`. All responses are JSON; errors are `{"ok": fal
 
 ```
 install.sh              self-extracting installer (bundles bridge.py + work.sh + app.html PWA)
-Torrent_Saver.shortcut  the iOS Shortcut (import into the Shortcuts app)
+Torrent_Saver.shortcut  the Shortcut for iPhone, iPad and Mac (import into the Shortcuts app)
 howto_downloads.gif     help clip served at /help/howto_downloads.gif
 README.md               this file
 LICENSE                 MIT
