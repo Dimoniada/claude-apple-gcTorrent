@@ -2122,7 +2122,7 @@ cat > "$APP/app.html" << '__GCTORRENT_APP_HTML__'
     if(timer){ clearInterval(timer); timer=null; }
     document.getElementById("app").innerHTML=
       '<div class="empty" style="margin:auto">👋 Stopped.<br>'
-      +'You can exit, iSH is closed now.</div>';
+      +'You can close iSH now.</div>';
     // Best-effort: close the tab if the browser allows a script-initiated close.
     try{ window.close(); }catch(e){}
   }
