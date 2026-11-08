@@ -7,11 +7,37 @@
 #   … && sh install.sh
 # work.sh is non-interactive; it just needs the iOS Location permission granted
 # (Always) to keep running in the background.
+#
+# The same file also installs natively on macOS (run it in Terminal):
+#   curl -fsSL -o /tmp/gctorrent-install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh /tmp/gctorrent-install.sh
+# There it uses Homebrew instead of apk, lives in ~/gctorrent, saves torrents to
+# ~/Downloads, and a launchd LaunchAgent replaces the .profile hook + Location trick.
 set -e
 
+if [ "$(uname -s)" = "Darwin" ]; then
+    IS_MAC=1
+    BASE="$HOME"
+    MAC_LABEL="io.github.dimoniada.gctorrent"
+    MAC_PLIST="$HOME/Library/LaunchAgents/$MAC_LABEL.plist"
+    # Terminal may not have Homebrew on PATH yet (fresh shell, no profile).
+    for d in /usr/local/bin /opt/homebrew/bin; do
+        [ -x "$d/brew" ] && PATH="$d:$PATH"
+    done
+    export PATH
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "Homebrew is required on macOS. Install it from https://brew.sh,"
+        echo "then run this installer again."
+        exit 1
+    fi
+else
+    IS_MAC=
+    BASE=/root
+fi
+APP="$BASE/gctorrent"
+
 echo "[0/4] extracting bundled bridge.py and work.sh..."
-mkdir -p /root/gctorrent/state
-cat > /root/gctorrent/bridge.py << '__GCTORRENT_BRIDGE_PY__'
+mkdir -p "$APP/state"
+cat > "$APP/bridge.py" << '__GCTORRENT_BRIDGE_PY__'
 #!/usr/bin/env python3
 """
 bridge.py — runs INSIDE iSH, alongside rtorrent itself.
@@ -61,6 +87,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -74,10 +101,13 @@ from xmlrpc.client import Binary, dumps, loads
 # it, never the network.
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 5001
+# Same code runs in iSH (as root, HOME=/root) and natively on macOS (as the
+# logged-in user). Only the paths differ; see HOME_DIR/DEFAULT_DIR below.
+IS_MAC = sys.platform == "darwin"
 # rtorrent now listens on a Unix domain socket instead of TCP loopback.
 # AF_UNIX avoids the emulated TCP-stack overhead in iSH, which was the source
 # of the "[Errno 107] Socket not connected" drops under heavy disk I/O.
-RTORRENT_SOCK = "/root/gctorrent/state/rtorrent.sock"
+RTORRENT_SOCK = os.path.expanduser("~/gctorrent/state/rtorrent.sock")
 
 # All app files live under ~/gctorrent/. settings.json holds user preferences
 # (the save path, the dashboard poll rate, and whatever we add later); paths
@@ -363,6 +393,10 @@ HOME_DIR = "/root"
 # Fallback when the folder is left blank: the conventional downloads directory,
 # which is also rtorrent's directory.default.set.
 DEFAULT_DIR = "/root/downloads"
+if IS_MAC:
+    # On macOS ~/Downloads plays the role of iSH's /root: typed folders go inside
+    # it, and a blank folder means ~/Downloads itself.
+    HOME_DIR = DEFAULT_DIR = os.path.expanduser("~/Downloads")
 
 
 def resolve_directory(directory):
@@ -382,6 +416,11 @@ def resolve_directory(directory):
     torrent comes back as "Download registered as completed, but hash check
     returned unfinished chunks." An absolute path removes the ambiguity."""
     d = os.path.expanduser((directory or "").strip())
+    # The folder lands inside d.directory.set="..."; a quote (or an escaped one)
+    # would end that string and run the rest as rtorrent commands, which can
+    # execute programs.
+    if '"' in d or "\\" in d:
+        raise RuntimeError("BAD_REQUEST")
     if not d:
         return DEFAULT_DIR
     if not os.path.isabs(d):
@@ -580,6 +619,21 @@ def do_add_raw(data_b64, directory):
     raise RuntimeError("INVALID_LINK")
 
 
+def stop_rtorrent():
+    """SIGTERM rtorrent (clean session save); work.sh respawns it unless detached.
+    In iSH ours is the only rtorrent, so -x matches the exact process name like
+    the autostart guard does. On macOS the user may run an rtorrent of their own,
+    so only stop the one work.sh started (it records the PID)."""
+    if IS_MAC:
+        try:
+            with open(os.path.join(STATE_DIR, "rtorrent.pid")) as f:
+                os.kill(int(f.read().strip()), 15)
+        except (OSError, ValueError):
+            pass
+        return
+    subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
+
+
 def do_detach():
     """Put the backend into 'maintenance mode' and stop rtorrent, so the Shortcut
     can free the iSH terminal *before* opening it for a reinstall — the user
@@ -599,7 +653,7 @@ def do_detach():
     except OSError:
         pass
     try:
-        subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
+        stop_rtorrent()
     except Exception:  # noqa: BLE001 - pkill missing/odd env: still report ok
         pass
 
@@ -655,7 +709,7 @@ def do_resume(h):
 
     # Kill rtorrent. work.sh handles the auto-restart loop.
     try:
-        subprocess.run(["pkill", "-TERM", "-x", "rtorrent"], timeout=5, check=False)
+        stop_rtorrent()
     except Exception as e:
         log("resume: pkill failed: %s" % e)
 
@@ -674,15 +728,19 @@ def do_remove(h, delete_file):
     """Stop + erase a torrent, optionally deleting its data. Copied from
     rtorrent_rpc.py's cmd_remove."""
     log("remove: %s (deleteFile=%s)" % (h, delete_file))
-    directory = scgi_call("d.directory", (h,))
+    path = scgi_call("d.directory", (h,))
+    # A single-file torrent's d.directory is the folder it was saved INTO (e.g.
+    # ~/Downloads); deleting that would take every other file with it.
+    if not scgi_call("d.is_multi_file", (h,)):
+        path = os.path.join(path, scgi_call("d.name", (h,)))
     scgi_call("d.stop", (h,))
     scgi_call("d.close", (h,))
     scgi_call("d.erase", (h,))
-    if delete_file and directory and os.path.exists(directory):
-        if os.path.isdir(directory):
-            shutil.rmtree(directory, ignore_errors=True)
+    if delete_file and path and os.path.exists(path):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
         else:
-            os.remove(directory)
+            os.remove(path)
 
 
 def read_settings():
@@ -920,9 +978,6 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            # CORS header so the Scriptable WebView (loaded via loadHTML, treated
-            # as a different origin) is allowed to fetch() these endpoints.
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -942,7 +997,6 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1053,6 +1107,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         log("POST", self.path)
+        # Any web page can send requests to 127.0.0.1, and browsers tag them with
+        # an Origin header. Only our own /app page acts; Shortcuts sends none.
+        if self.headers.get("Origin") not in (
+                None, "http://127.0.0.1:%d" % BRIDGE_PORT, "http://localhost:%d" % BRIDGE_PORT):
+            self._send_json({"ok": False, "error": "FORBIDDEN"}, status=403)
+            return
         try:
             try:
                 data = self._read_body()
@@ -1171,12 +1231,23 @@ if __name__ == "__main__":
     log(f"bridge.py listening on {BRIDGE_HOST}:{BRIDGE_PORT}")
     server.serve_forever()
 __GCTORRENT_BRIDGE_PY__
-cat > /root/gctorrent/work.sh << '__GCTORRENT_WORK_SH__'
+cat > "$APP/work.sh" << '__GCTORRENT_WORK_SH__'
 #!/bin/sh
 # work.sh — starts the status bridge (always), and unless detached, the location
 # keep-alive + rtorrent. Run instead of `rtorrent` directly. Non-interactive.
+# On macOS launchd runs it (see install.sh) and there is no location keep-alive.
 
-APP_DIR="/root/gctorrent"
+if [ "$(uname -s)" = "Darwin" ]; then
+    IS_MAC=1
+    APP_DIR="$HOME/gctorrent"
+    # Apple's ps shows the real interpreter path, not "python3", so match the
+    # script path alone.
+    BRIDGE_PATTERN="$APP_DIR/bridge.py"
+else
+    IS_MAC=
+    APP_DIR="/root/gctorrent"
+    BRIDGE_PATTERN="python3 $APP_DIR/bridge.py"
+fi
 STATE_DIR="$APP_DIR/state"
 LOCATION_LOG="$STATE_DIR/location_check"
 FLAG_FILE="$STATE_DIR/location_confirmed"
@@ -1200,7 +1271,7 @@ trap cleanup EXIT TERM
 # Remove the one-shot installer bootstrap if it's still around (install.sh execs
 # us at the end of a fresh install/update). By now install.sh is a closed file,
 # so this is an ordinary unlink; harmless -f no-op on normal autostart launches.
-rm -f /root/install.sh
+[ -z "$IS_MAC" ] && rm -f /root/install.sh
 
 # Mark that setup has run, up front — so the autostart hook keeps launching us on
 # future iSH opens even if this run aborts before location is granted.
@@ -1211,7 +1282,7 @@ touch "$FLAG_FILE"
 # 127.0.0.1:5001 — even with rtorrent down or in maintenance mode — so /ping
 # answers (ok:false, error:DETACHED) instead of refusing the connection and
 # hard-halting the Shortcut.
-if ! pgrep -f "python3 $APP_DIR/bridge.py" >/dev/null 2>&1; then
+if ! pgrep -f "$BRIDGE_PATTERN" >/dev/null 2>&1; then
     # Clear any stale readiness marker so the wait before rtorrent tracks THIS
     # bridge's bind, not a dead one's. Only the spawn path clears it — when the
     # bridge is already running (else branch), its marker persists so the wait
@@ -1225,6 +1296,66 @@ if ! pgrep -f "python3 $APP_DIR/bridge.py" >/dev/null 2>&1; then
     echo "Status bridge started on 127.0.0.1:5001"
 else
     echo "Status bridge already running on 127.0.0.1:5001"
+fi
+
+# macOS: launchd keeps this script alive and nothing suspends it, so there is no
+# location keep-alive and no 3-attempt limit. Loop forever: idle while detached
+# (maintenance mode; POST /attach resumes within seconds), otherwise run
+# rtorrent headless and restart it whenever it exits — which also covers the
+# bridge's pkill-based restarts. Back off when it keeps dying right away.
+if [ -n "$IS_MAC" ]; then
+    # launchd's default soft limit is 256 open files; rtorrent refuses to start
+    # below 512 ("max_open too low").
+    ulimit -n 4096 2>/dev/null || ulimit -n 1024 2>/dev/null
+    # launchd stops the agent (logout, reinstall) with SIGTERM. The shared trap
+    # above would run cleanup and carry on, so launchd would wait ~20s and then
+    # SIGKILL everything mid-save. Instead: let rtorrent save its session and
+    # exit, stop the bridge, and exit.
+    RT_PID=
+    stop_all() {
+        if [ -n "$RT_PID" ]; then
+            kill "$RT_PID" 2>/dev/null
+            wait "$RT_PID" 2>/dev/null
+        fi
+        [ -f "$STATE_DIR/bridge.pid" ] && kill "$(cat "$STATE_DIR/bridge.pid")" 2>/dev/null
+        rm -f "$STATE_DIR/rtorrent.pid"
+        exit 0
+    }
+    trap stop_all TERM INT
+    i=0
+    while [ ! -f "$READY_FLAG" ] && [ "$i" -lt 15 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    fails=0
+    while :; do
+        if [ -f "$DETACH_FLAG" ]; then
+            sleep 2
+            continue
+        fi
+        started=$(date +%s)
+        echo "Starting rtorrent..."
+        # rtorrent reads $XDG_CONFIG_HOME/rtorrent/rtorrent.rc before
+        # ~/.rtorrent.rc, so pointing it at our folder leaves a user's own rtorrent
+        # setup untouched. (-o import=... runs too early: schedule2 isn't defined.)
+        # The PID lets the bridge stop exactly this rtorrent, not the user's.
+        XDG_CONFIG_HOME="$APP_DIR/config" rtorrent &
+        RT_PID=$!
+        echo "$RT_PID" > "$STATE_DIR/rtorrent.pid"
+        wait "$RT_PID"
+        rc=$?
+        RT_PID=
+        rm -f "$STATE_DIR/rtorrent.pid"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') rtorrent exited rc=$rc" \
+            >> "$STATE_DIR/rtorrent-exits.log"
+        # Resume restarts it on purpose and that exits 0; only count real crashes.
+        if [ "$rc" -ne 0 ] && [ $(($(date +%s) - started)) -lt 30 ]; then
+            fails=$((fails + 1))
+        else
+            fails=0
+        fi
+        if [ "$fails" -ge 3 ]; then sleep 60; else sleep 3; fi
+    done
 fi
 
 # Maintenance mode: bridge stays up (above), rtorrent stays down, shell is free.
@@ -1281,7 +1412,8 @@ done
 
 # Start rtorrent in a loop so bridge.py can trigger a restart by killing it.
 # To stop for real, use the "Detach" feature (which sets $DETACH_FLAG). Give up
-# after 3 start attempts so a persistent crash doesn't loop forever. The 5s wait
+# after 3 failed runs in a row so a persistent crash doesn't loop forever; a
+# clean exit (Resume's deliberate restart, or ^Q) resets the count. The 5s wait
 # gives the user time to hit ^C to cancel the respawn — ^C is untrapped (see the
 # trap above), so it aborts work.sh to the shell while the bridge + location
 # reader keep running.
@@ -1300,6 +1432,7 @@ while [ ! -f "$DETACH_FLAG" ] && [ "$attempt" -lt 3 ]; do
     [ -f "$DETACH_FLAG" ] && break
     echo "restarting rtorrent in 5 sec (attempt $attempt of 3)"
     sleep 5
+    [ "$rc" -eq 0 ] && attempt=0
 done
 
 if [ "$attempt" -ge 3 ] && [ ! -f "$DETACH_FLAG" ]; then
@@ -1314,8 +1447,8 @@ fi
 __GCTORRENT_WORK_SH__
 
 for f in bridge.py work.sh; do
-    if [ ! -f "/root/gctorrent/$f" ]; then
-        echo "Missing /root/gctorrent/$f after extraction - aborting."
+    if [ ! -f "$APP/$f" ]; then
+        echo "Missing $APP/$f after extraction - aborting."
         exit 1
     fi
 done
@@ -1349,10 +1482,22 @@ apk_retry() {
 # musl libc, whose resolver queries all listed nameservers in parallel and takes
 # the first reply — so a working network DNS is unaffected (it still answers
 # first) while a dead hotspot resolver is transparently bypassed. Idempotent.
+if [ -z "$IS_MAC" ]; then
 grep -qsF 'nameserver 8.8.8.8' /etc/resolv.conf \
   || echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+fi
 
 echo "[1/4] installing packages (python3, rtorrent)..."
+if [ -n "$IS_MAC" ]; then
+    # install also upgrades an outdated rtorrent; the config below needs 0.16+.
+    brew install rtorrent
+    # Prefer Homebrew's python3; Apple's /usr/bin/python3 works too once the
+    # Command Line Tools are installed. Install Homebrew's if neither runs.
+    if ! "$(brew --prefix)/bin/python3" -c 'import http.server' >/dev/null 2>&1 \
+       && ! /usr/bin/python3 -c 'import http.server' >/dev/null 2>&1; then
+        brew install python
+    fi
+else
 # update is best-effort: if the index refresh ultimately fails but a cached
 # index exists, `apk add` can still install from it. add MUST succeed, so its
 # failure stays fatal (set -e aborts) — there's no app without the packages.
@@ -1362,17 +1507,23 @@ echo "[1/4] installing packages (python3, rtorrent)..."
 apk_retry update || true
 apk_retry add python3
 apk_retry add rtorrent
+fi
 
 # Fetch the help clip served at GET /help/downloads.gif. Non-fatal.
 echo "  fetching help clip (howto_downloads.gif)..."
-wget -qO /root/gctorrent/howto_downloads.gif \
-  https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/howto_downloads.gif \
+GIF_URL=https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/howto_downloads.gif
+if [ -n "$IS_MAC" ]; then
+    curl -fsSL -o "$APP/howto_downloads.gif" "$GIF_URL" \
+      || echo "  (help clip download skipped)"
+else
+wget -qO /root/gctorrent/howto_downloads.gif "$GIF_URL" \
   || echo "  (help clip download skipped)"
+fi
 
 # Write the PWA page served at GET /app. Embedded (not fetched) so it ships in
 # lock-step with this installer's bridge.py; quoted heredoc = verbatim.
 echo "  writing PWA page (app.html)..."
-cat > /root/gctorrent/app.html << '__GCTORRENT_APP_HTML__'
+cat > "$APP/app.html" << '__GCTORRENT_APP_HTML__'
 <!DOCTYPE html>
 <!-- Standalone "Torrent Saver" PWA, served by bridge.py at GET /app. Unlike
      dashboard.js (which runs inside a Scriptable WebView via loadHTML), this
@@ -1948,7 +2099,7 @@ cat > /root/gctorrent/app.html << '__GCTORRENT_APP_HTML__'
       }
     }catch(e){
       document.getElementById("list").innerHTML=
-        '<div class="empty">Cannot reach bridge (is iSH open?)</div>';
+        '<div class="empty">Cannot reach bridge (is iSH open? On a Mac: is the backend installed?)</div>';
       document.getElementById("updated").textContent="";
       renderQueue("ONLINE", []);
     }
@@ -2039,9 +2190,110 @@ cat > /root/gctorrent/app.html << '__GCTORRENT_APP_HTML__'
 </html>
 __GCTORRENT_APP_HTML__
 
-if [ ! -s /root/gctorrent/app.html ]; then
-    echo "Missing /root/gctorrent/app.html after write - aborting."
+if [ ! -s "$APP/app.html" ]; then
+    echo "Missing $APP/app.html after write - aborting."
     exit 1
+fi
+
+# ---- macOS: config + launchd agent, then done (the iSH steps below don't apply).
+if [ -n "$IS_MAC" ]; then
+    echo "[2/4] directories + rtorrent.rc..."
+    DL_DIR="$BASE/Downloads"
+    mkdir -p "$APP/session" "$APP/state" "$APP/config/rtorrent" "$DL_DIR"
+    # rtorrent's SCGI socket can run commands as this user, so keep it private:
+    # on a Mac other local accounts exist (iSH's 0777 chmod is not repeated here).
+    chmod 700 "$APP/state"
+    # Our own rc file (work.sh sets XDG_CONFIG_HOME=$APP/config): a ~/.rtorrent.rc
+    # the user may already have is never overwritten.
+    cat > "$APP/config/rtorrent/rtorrent.rc" << RCEOF
+# Written by gcTorrent install.sh (macOS). Re-running the installer replaces it.
+system.daemon.set = true
+network.scgi.open_local = $APP/state/rtorrent.sock
+directory.default.set = $DL_DIR
+session.path.set = $APP/session
+dht.mode.set = auto
+protocol.pex.set = yes
+# Homebrew ships rtorrent 0.16+, which renamed iSH's network.port_range/random
+# and replaced schedule2 with schedule.
+network.listen.port.range.set = 6890-9999
+network.listen.port.random.set = yes
+schedule = dht_node, 5, 0, "dht.add_node=dht.transmissionbt.com:6881"
+schedule = session_save, 300, 300, ((session.save))
+network.xmlrpc.size_limit.set = 8388608
+log.open_file = "rtorrent", "$APP/state/rtorrent.log"
+# 0.16 dropped the info/warn/error level groups.
+log.add_output = "errors", "rtorrent"
+log.add_output = "events", "rtorrent"
+RCEOF
+
+    echo "[3/4] making work.sh executable..."
+    chmod +x "$APP/work.sh"
+    # (Re)install returns to normal: clear the maintenance + readiness flags.
+    rm -f "$APP/state/detached" "$APP/state/bridge_ready"
+
+    echo "[4/4] installing the launchd agent (starts at login, restarts if it stops)..."
+    # Stopping the old agent also stops its bridge + rtorrent (same process group);
+    # rtorrent gets SIGTERM and saves its session first.
+    launchctl bootout "gui/$(id -u)/$MAC_LABEL" 2>/dev/null || true
+    mkdir -p "$(dirname "$MAC_PLIST")"
+    cat > "$MAC_PLIST" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$MAC_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>$APP/work.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>$(brew --prefix)/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$APP/state/work.log</string>
+    <key>StandardErrorPath</key>
+    <string>$APP/state/work.log</string>
+</dict>
+</plist>
+PLISTEOF
+    # bootout returns before the old job is fully gone; retry briefly.
+    i=0
+    until launchctl bootstrap "gui/$(id -u)" "$MAC_PLIST" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 10 ]; then
+            echo "Could not start the launchd agent ($MAC_PLIST)."
+            exit 1
+        fi
+        sleep 1
+    done
+
+    i=0
+    until curl -s -m 2 -o /dev/null http://127.0.0.1:5001/ping; do
+        i=$((i + 1))
+        if [ "$i" -ge 20 ]; then
+            echo "The bridge did not answer on 127.0.0.1:5001 yet."
+            echo "Check $APP/state/work.log and $APP/bridge.log."
+            exit 1
+        fi
+        sleep 1
+    done
+
+    echo ""
+    echo "Setup done. The backend runs in the background and starts at every login."
+    echo "Torrents are saved to $DL_DIR (a folder you type goes inside it)."
+    echo "Open the Torrent Saver shortcut, or http://127.0.0.1:5001/app"
+    [ -z "$GCT_NO_OPEN" ] && open "http://127.0.0.1:5001/app"
+    exit 0
 fi
 
 echo "[2/4] directories + .rtorrent.rc..."
