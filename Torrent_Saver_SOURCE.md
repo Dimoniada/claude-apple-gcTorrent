@@ -5,10 +5,6 @@ Decoded from `Torrent_Saver.shortcut` (v3.0, 08.11.2026). 102 actions total.
 One shortcut for iPhone, iPad **and Mac**: it reads the device model once. A Mac gets its own
 setup menu (no iSH step) and opens the app directly; iPhone/iPad keep the v2.2 menus unchanged.
 
-> **Branch build:** on `feat/mac-support` the shipped `Torrent_Saver.shortcut` installs from
-> `…/feat/mac-support/install.sh` (both install scripts), so the branch can be tested on its own.
-> Switch both back to `…/main/install.sh` (as written below) before merging into `main`.
-
 - Name the shortcut: **Torrent Saver**
 - Settings ▸ turn on **Show in Share Sheet** is *not* required (this build is a launcher/menu).
   In the shortcut's details it is set to appear as an **Action Extension**, on **Apple Watch**,
