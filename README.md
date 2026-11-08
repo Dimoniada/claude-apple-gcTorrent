@@ -108,7 +108,7 @@ The Shortcut is a thin **launcher / installer**, not the torrent UI — the actu
 
 On a Mac there's no iSH step:
 
-- **⚙️ Set up / reinstall** shows a Mac menu: **⤵️ Install / update backend** (copies the Mac install command, shows how to paste it, and opens **Terminal**; no `/detach`, because the installer stops the old backend itself), **🛟 Help** and **⬅️ Return**.
+- **⚙️ Set up / reinstall** shows a Mac menu: **1) Install Homebrew** (copies Homebrew's official install command, shows how to paste it, and opens **Terminal**), **2) Install / update backend** (the same for the Mac install command; no `/detach`, because the installer stops the old backend itself), **🛟 Help** and **⬅️ Return**.
 - **🏴‍☠️ Torrent Saver** opens the PWA straight away, because the LaunchAgent keeps the backend running.
 
 ### The PWA app — the UI

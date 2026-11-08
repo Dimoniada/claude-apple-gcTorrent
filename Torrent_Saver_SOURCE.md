@@ -1,7 +1,7 @@
 # Torrent Saver — manual rebuild guide
 
 Recreate this shortcut by hand in the **Shortcuts** app (no signed file needed).
-Decoded from `Torrent_Saver.shortcut` (v3.0, 08.11.2026). 102 actions total.
+Decoded from `Torrent_Saver.shortcut` (v3.0, 08.11.2026). 108 actions total.
 One shortcut for iPhone, iPad **and Mac**: it reads the device model once. A Mac gets its own
 setup menu (no iSH step) and opens the app directly; iPhone/iPad keep the v2.2 menus unchanged.
 
@@ -160,12 +160,24 @@ Close it with **End Menu**, then **End If** (the Mac test), then the **End If** 
 ```
         Text  (name it "install script (Mac)") =
             curl -fsSL -o /tmp/gctorrent-install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh /tmp/gctorrent-install.sh
-        Menu  "⚙️ Set up / reinstall:"   (3 items):
-              ⤵️ Install / update backend
+        Menu  "⚙️ Set up / reinstall:"   (4 items):
+              1) Install Homebrew
+              2) Install / update backend
               🛟 Help
               ⬅️ Return
 ```
-   • **Case ⤵️ Install / update backend** (no `/detach`: the installer stops the old backend itself)
+   • **Case 1) Install Homebrew**
+   ```
+              Text  (name it "Homebrew install") =
+                  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+              Copy to Clipboard  (the "Homebrew install" Text)
+              Show Alert   title: "Homebrew install:"
+                           message: (see ALERT-BREW below)
+                           (turn OFF the Cancel button)
+              Open App  Terminal
+              Exit Shortcut
+   ```
+   • **Case 2) Install / update backend** (no `/detach`: the installer stops the old backend itself)
    ```
               Copy to Clipboard  (the "install script (Mac)" Text)
               Show Alert   title: "Mac install:"
@@ -215,6 +227,11 @@ Needed:
 1) iSH with Location turned to "Always allow" (for background stay-alive)
 2) Free local port 5001 
 3) Web connection for downloading ~60 Mb of dependencies and GitHub scripts
+```
+
+**ALERT-BREW** (title `Homebrew install:`, Cancel button OFF):
+```
+The Homebrew install command is copied. In Terminal press ⌘V, then Return. When asked, type your Mac password (it isn't shown) and press Return. It can take a few minutes. When it finishes, re-run the shortcut and use "2) Install / update backend".
 ```
 
 **ALERT-MAC** (title `Mac install:`, Cancel button OFF):
