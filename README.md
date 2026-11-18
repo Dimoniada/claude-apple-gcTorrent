@@ -1,8 +1,8 @@
 # claude-apple-gcTorrent
 
-**A gcTorrent client that runs entirely on a stock iPhone or iPad — no jailbreak, no seedbox, no App Store torrent app. An iOS Shortcut installs and launches it; an installable PWA is the UI.** The same Shortcut and installer also run natively on a Mac (no iSH needed there).
+**A gcTorrent client that runs entirely on a stock iPhone, iPad or Mac — no jailbreak, no seedbox, no App Store torrent app. A Shortcut installs and launches it; an installable PWA is the UI.**
 
-The [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a file AF_UNIX socket + JSON API on loopback. The UI is an installable **PWA** (served by the bridge itself at `/app`): add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`. The native **Shortcuts** app is a thin **launcher / installer** — it installs the backend, and its everyday action just opens iSH and then the PWA.
+On iPhone and iPad, [`rtorrent`](https://github.com/rakshasa/rtorrent) runs inside [iSH](https://ish.app) (an Alpine Linux userland on iOS). On a Mac it runs natively instead: rtorrent comes from Homebrew and launchd keeps the backend running, so no iSH is needed. A tiny, dependency-free Python **bridge** fronts rtorrent's SCGI interface as a file AF_UNIX socket + JSON API on loopback. The UI is an installable **PWA** (served by the bridge itself at `/app`): add a magnet or `.torrent`, watch progress, pause/resume/remove — all on the device, over `127.0.0.1`. The native **Shortcuts** app is a thin **launcher / installer** — it installs the backend, and its everyday action opens iSH and then the PWA (on a Mac, just the PWA).
 
 The bridge is **asynchronous and command-driven**: control actions enqueue a command and return instantly, and a single background worker applies them to rtorrent (retrying while the daemon is busy) so the UI never blocks on a slow or pinned daemon.
 
@@ -11,8 +11,8 @@ The bridge is **asynchronous and command-driven**: control actions enqueue a com
 ## Why
 
 - **No jailbreak** and **no App Store torrent client** — everything runs in userland apps you can install today.
-- **No remote seedbox / VPS** — the torrents live and download on *your* phone.
-- **Simple UI** — the control surface is an installable **PWA** served by the bridge itself; a native iOS Shortcut installs the backend and opens it (tap / share / clipboard).
+- **No remote seedbox / VPS** — the torrents live and download on *your* own device.
+- **Simple UI** — the control surface is an installable **PWA** served by the bridge itself; a native Shortcut installs the backend and opens it (tap / share / clipboard).
 
 ## How it works
 
@@ -29,31 +29,34 @@ The bridge is **asynchronous and command-driven**: control actions enqueue a com
 └─────────────┘
 ```
 
-- **`bridge.py`** translates HTTP + JSON ⇄ rtorrent's SCGI/XML-RPC. **Standard library only** — the only iSH-side dependency is `python3`.
+- **`bridge.py`** translates HTTP + JSON ⇄ rtorrent's SCGI/XML-RPC. **Standard library only** — the only dependency is `python3`.
 - Everything binds `127.0.0.1`, so nothing is exposed off the device.
-- **`work.sh`** keeps the stack alive: it starts the bridge, uses the iOS location API as a background keep-alive, and launches rtorrent.
+- **`work.sh`** keeps the stack alive: it starts the bridge, on iPhone / iPad uses the iOS location API as a background keep-alive, and launches rtorrent.
+- On a Mac the same bridge and rtorrent run natively instead of inside iSH; launchd starts `work.sh` at every login.
 
 ## Components
 
 | Piece | Where | Role |
 |---|---|---|
-| **`install.sh`** | this repo | Self-extracting one-time installer. Bundles `bridge.py` + `work.sh` (as heredocs), installs `python3` + `rtorrent`, writes `~/.rtorrent.rc`, and adds a `.profile` autostart hook. |
+| **`install.sh`** | this repo | Self-extracting one-time installer. Bundles `bridge.py` + `work.sh` (as heredocs), installs `python3` + `rtorrent`, writes `~/.rtorrent.rc`, and adds a `.profile` autostart hook. On a Mac: Homebrew, `~/gctorrent/config/rtorrent/rtorrent.rc` and a LaunchAgent instead. |
 | **`bridge.py`** | bundled in `install.sh` → `~/gctorrent/bridge.py` | The HTTP + JSON API on `127.0.0.1:5001`. Stdlib-only. Runs an async command queue + background worker, and serves the PWA. |
-| **`work.sh`** | bundled in `install.sh` → `~/gctorrent/work.sh` | Boots bridge + location keep-alive + rtorrent on every iSH launch. |
+| **`work.sh`** | bundled in `install.sh` → `~/gctorrent/work.sh` | Boots bridge + location keep-alive + rtorrent on every iSH launch. On a Mac: bridge + rtorrent at every login, under launchd. |
 | **`app.html`** | bundled in `install.sh` → `~/gctorrent/app.html`; served at `/app` | Standalone installable **PWA** ("Torrent Saver"). Same-origin with the bridge, so no CORS. Add to Home Screen for a full-screen app. |
 | **`howto_downloads.gif`** | this repo → served at `/help/howto_downloads.gif` | Short clip showing how to find the downloads folder in Files. |
-| **`Torrent_Saver.shortcut`** | this repo (also on device) | The launcher / installer Shortcut: install iSH, install/update the backend, and open the PWA. Download and import it (see below). |
+| **`Torrent_Saver.shortcut`** | this repo (also on device) | The launcher / installer Shortcut: install iSH (on a Mac: Homebrew), install/update the backend, and open the PWA. Download and import it (see below). |
+| **`Torrent_Saver_SOURCE.md`** | this repo | The Shortcut decoded into a step-by-step guide, to rebuild it by hand in the Shortcuts app. |
 
 ## Requirements
 
 - iPhone / iPad with these free apps: **[iSH Shell](https://apps.apple.com/app/ish-shell/id1436902243)** and **[Shortcuts](https://apps.apple.com/app/shortcuts/id915249334)**.
 - **iSH → Settings → Location → Always.** rtorrent runs as iSH's foreground app; the location keep-alive is what lets it survive in the background. Without it, rtorrent only runs while iSH is open in the foreground.
 - **iSH → Settings → Files integration ON** if you want to reach the downloads folder from the Files app.
-- Mac: [Homebrew](https://brew.sh) and the Shortcuts app (built in). No iSH: the iOS version of iSH runs on Apple-silicon Macs, but its Files integration crashes there, and a Mac can run rtorrent natively anyway.
+- A recent Shortcuts app: the Shortcut needs Shortcuts build 5023 or later (about iOS / iPadOS / macOS 27). Older versions refuse to import it ("created on a newer version").
+- Mac: [Homebrew](https://brew.sh) (the Shortcut's **1) Install Homebrew** sets it up) and the Shortcuts app (built in). No iSH: the iOS version of iSH runs on Apple-silicon Macs, but its Files integration crashes there, and a Mac can run rtorrent natively anyway.
 
 ## Install
 
-In iSH, paste and run:
+On iPhone / iPad, in iSH, paste and run:
 
 ```sh
 cd /root && apk update && apk add ca-certificates wget && \
@@ -67,7 +70,7 @@ cd /root && apk update && apk add ca-certificates wget && \
 
 ### Install on a Mac
 
-The same `install.sh` detects macOS. In **Terminal**, paste and run (the Shortcut's **2) Install backend** copies this for you and opens Terminal):
+The same `install.sh` detects macOS. In **Terminal**, paste and run (the Shortcut's **2) Install / update backend** copies this for you and opens Terminal):
 
 ```sh
 curl -fsSL -o /tmp/gctorrent-install.sh https://raw.githubusercontent.com/Dimoniada/claude-apple-gcTorrent/main/install.sh && sh /tmp/gctorrent-install.sh
@@ -92,16 +95,16 @@ launchctl bootout gui/$(id -u)/io.github.dimoniada.gctorrent; rm -f ~/Library/La
 
 ### Get the Shortcut
 
-Download **[`Torrent_Saver.shortcut`](Torrent_Saver.shortcut)** (https://routinehub.co/shortcut/26039/) from this repo and open it to import into the Shortcuts app. Importing a file directly needs **Settings → Shortcuts → Allow Untrusted Shortcuts** enabled. (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.) It's one Shortcut for iPhone, iPad and Mac: it checks the device model and takes the Mac path when it contains "Mac", so the copy synced through iCloud works everywhere.
+Download **[`Torrent_Saver.shortcut`](Torrent_Saver.shortcut)** (https://routinehub.co/shortcut/26039/) from this repo and open it to import into the Shortcuts app. The file is signed by Apple for anyone, so it imports without **Allow Untrusted Shortcuts**. If it won't import, rebuild it by hand from [`Torrent_Saver_SOURCE.md`](Torrent_Saver_SOURCE.md). (Hosting the file here — rather than only an iCloud share link — keeps it available regardless of Apple's link moderation.) It's one Shortcut for iPhone, iPad and Mac: it checks the device model and takes the Mac path when it contains "Mac", so the copy synced through iCloud works everywhere.
 
 ## Using it — the "Torrent Saver" Shortcut
 
-The Shortcut is a thin **launcher / installer**, not the torrent UI — the actual control surface is the PWA it opens. Its first action sets `BaseURL` to `http://127.0.0.1:5001`. Running it (tap it, or trigger it from the share sheet / with a clipboard item) opens a menu:
+The Shortcut is a thin **launcher / installer**, not the torrent UI — the actual control surface is the PWA it opens. Its first action sets `BaseURL` to `http://127.0.0.1:5001`. Running it (tap it, or trigger it from the share sheet / with a clipboard item) opens a menu. On iPhone / iPad:
 
 - **⚙️ Set up / reinstall** — a setup submenu:
   - **1) Install iSH** — opens the iSH App Store page.
   - **2) Install backend** — **⤵️ New install** or **🔄 Update**: both copy the one-line install command (below) to the clipboard and show a short "paste it into iSH" instruction; the **🔄 Update** path first `POST`s `/detach` so rtorrent steps aside cleanly while you reinstall. **⬅️ Return** goes back.
-  - **🛟 Help** — **📖 Readme** (shows the dependency checklist: iSH with Location → Always, free ports 5000 & 5001, a web connection for ~60 Mb), **🔗 GitHub** (opens this repo), **⬅️ Return**.
+  - **🛟 Help** — **📖 Readme** (shows the dependency checklist: iSH with Location → Always, free port 5001, a web connection for ~60 Mb), **🔗 GitHub** (opens this repo), **⬅️ Return**.
   - **⬅️ Return** — back to the top menu.
 - **🏴‍☠️ Torrent Saver** — the everyday entry point. It opens **iSH** (so the stack comes up), waits a moment, then opens the installable **PWA** (`BaseURL/app`) in your default browser — that's where you add magnets / `.torrent`s and manage torrents.
 - **🚼 Exit** — close the Shortcut.
@@ -113,7 +116,9 @@ On a Mac there's no iSH step:
 
 ### The PWA app — the UI
 
-The bridge serves a standalone **PWA** at `http://127.0.0.1:5001/app`; this is the control surface. The Shortcut's **🏴‍☠️ Torrent Saver** opens it for you, or you can open it directly in Safari or Orion and **Share → Add to Home Screen** to install it as a full-screen app with its own icon and name ("Torrent Saver"). Because the page is served from the bridge's own origin, every `fetch()` is same-origin — no CORS and no host injection. The PWA polls `/status` for a live list and drives every action (add, resume, pause, remove) through the async `/command` queue, so a busy or briefly unreachable rtorrent shows a degraded banner and the pending-command chain instead of erroring out; queued commands can be dragged to the bin (`/command/cancel`) before they run.
+The bridge serves a standalone **PWA** at `http://127.0.0.1:5001/app`; this is the control surface. The Shortcut's **🏴‍☠️ Torrent Saver** opens it for you, or you can open it directly in Safari or Orion and **Share → Add to Home Screen** (on a Mac: Safari → **File → Add to Dock**) to install it as a full-screen app with its own icon and name ("Torrent Saver"). Because the page is served from the bridge's own origin, every `fetch()` is same-origin — no CORS and no host injection. The PWA polls `/status` for a live list and drives every action (add, resume, pause, remove) through the async `/command` queue, so a busy or briefly unreachable rtorrent shows a degraded banner and the pending-command chain instead of erroring out; queued commands can be dragged to the bin (`/command/cancel`) before they run.
+
+**Close** in the PWA only stops the page. rtorrent keeps running in iSH until you close iSH itself (swipe it away in the app switcher). On a Mac the backend keeps running in the background by design.
 
 ### Where downloads go
 
@@ -123,7 +128,7 @@ On a Mac, `~/Downloads` plays the role of `/root`: a blank folder saves to `~/Do
 
 ### Maintenance mode (detach / attach)
 
-The Shortcut's **🔄 Update** path `POST`s `/detach` before you reinstall: rtorrent stops but the bridge keeps answering, so `/ping` reports `DETACHED` (maintenance) instead of refusing the connection. Finishing the reinstall clears the flag and resumes it (or `POST /attach` + reopening iSH).
+On iPhone / iPad, the Shortcut's **🔄 Update** path `POST`s `/detach` before you reinstall: rtorrent stops but the bridge keeps answering, so `/ping` reports `DETACHED` (maintenance) instead of refusing the connection. Finishing the reinstall clears the flag and resumes it (or `POST /attach` + reopening iSH).
 
 ## The bridge API
 
@@ -195,6 +200,8 @@ Base URL `http://127.0.0.1:5001`. All responses are JSON; errors are `{"ok": fal
 ```
 install.sh              self-extracting installer (bundles bridge.py + work.sh + app.html PWA)
 Torrent_Saver.shortcut  the Shortcut for iPhone, iPad and Mac (import into the Shortcuts app)
+Torrent_Saver_SOURCE.md the same Shortcut as a step-by-step rebuild guide
+tests/                  manual checks against a running bridge (security_check.sh, remove_check.sh)
 howto_downloads.gif     help clip served at /help/howto_downloads.gif
 README.md               this file
 LICENSE                 MIT
